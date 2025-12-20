@@ -1,14 +1,19 @@
 cmake_minimum_required(VERSION 3.15)
 
-# PGAS Attach Implementation using Frida
+# PGAS Attach Implementation using Frida with CXLMemSim integration
 set(PGAS_ATTACH_SOURCES
     src/pgas_attach_impl.cpp
+    src/pgas_cxlmemsim_integration.cpp
 )
 
 set(PGAS_ATTACH_HEADERS
     include/pgas_attach_impl.hpp
     include/pgas_attach_private_data.hpp
+    include/pgas_cxlmemsim_integration.hpp
 )
+
+# CXLMemSim client library path (from libpgas)
+set(CXLMEMSIM_CLIENT_INCLUDE ${CMAKE_SOURCE_DIR}/src/libpgas/include ${CMAKE_SOURCE_DIR}/src/libpgas/include/pgas)
 
 # Create library
 add_library(bpftime_pgas_attach_impl STATIC
@@ -21,6 +26,7 @@ target_include_directories(bpftime_pgas_attach_impl PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../base_attach_impl
     ${CMAKE_CURRENT_SOURCE_DIR}/../frida_uprobe_attach_impl/include
+    ${CXLMEMSIM_CLIENT_INCLUDE}
     ${SPDLOG_INCLUDE}
     ${FRIDA_GUM_INSTALL_DIR}
 )
@@ -63,6 +69,21 @@ if(BUILD_TESTING)
     )
 
     add_test(NAME test_pgas_attach COMMAND test_pgas_attach)
+
+    # CXLMemSim hook test (standalone, requires CXLMemSim server)
+    add_executable(test_cxlmemsim_hook
+        test/test_cxlmemsim_hook.cpp
+        ${CMAKE_SOURCE_DIR}/src/libpgas/src/cxlmemsim_client.c
+    )
+
+    target_link_libraries(test_cxlmemsim_hook
+        bpftime_pgas_attach_impl
+    )
+
+    target_include_directories(test_cxlmemsim_hook PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CXLMEMSIM_CLIENT_INCLUDE}
+    )
 endif()
 
 message(STATUS "PGAS attach implementation configured")
