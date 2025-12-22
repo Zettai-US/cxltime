@@ -63,6 +63,11 @@ public:
     bool is_overrided;
     uint64_t user_ret;
 
+    // Original function pointers (to avoid re-entrancy)
+    void *(*orig_memcpy)(void *, const void *, size_t);
+    void *(*orig_memmove)(void *, const void *, size_t);
+    void *(*orig_memset)(void *, int, size_t);
+
     pgas_internal_attach_entry(void *func, uint16_t local_node, uint16_t num_nodes,
                                 uint64_t base_addr, uint64_t size);
     ~pgas_internal_attach_entry();

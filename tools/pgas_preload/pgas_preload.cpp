@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
-// PGAS LD_PRELOAD library for memcached
-// Usage: LD_PRELOAD=libpgas_preload.so memcached [options]
+// PGAS LD_PRELOAD library for CXLMemSim
+// Usage: PGAS_CONFIG=config.conf LD_PRELOAD=libpgas_preload.so ./your_app
 
-#include "pgas_attach_impl.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,11 +11,15 @@
 #include <mutex>
 #include <fstream>
 #include <sstream>
+#include <cstdint>
+#include <alloca.h>
 
-using namespace bpftime::attach;
+// CXLMemSim client for remote memory access (from libpgas)
+extern "C" {
+#include "pgas/cxlmemsim_client.h"
+}
 
 // Global state
-static pgas_attach_impl *g_pgas_impl = nullptr;
 static std::mutex g_mutex;
 static bool g_initialized = false;
 
@@ -27,6 +30,12 @@ static uint64_t g_pgas_base = 0;
 static uint64_t g_pgas_size = 1ULL << 30;  // 1GB default
 static bool g_verbose = false;
 static bool g_enable_stats = true;
+
+// CXLMemSim configuration
+static char g_cxlmemsim_host[256] = "localhost";
+static int g_cxlmemsim_port = 9999;
+static cxlmemsim_ctx_t* g_cxlmemsim_ctx = nullptr;  // Connection to server
+static bool g_cxlmemsim_connected = false;
 
 // Statistics
 static std::atomic<uint64_t> g_total_memcpy{0};
@@ -50,15 +59,49 @@ typedef void* (*memset_fn)(void*, int, size_t);
 typedef void* (*malloc_fn)(size_t);
 typedef void (*free_fn)(void*);
 
-static memcpy_fn orig_memcpy = nullptr;
-static memmove_fn orig_memmove = nullptr;
-static memset_fn orig_memset = nullptr;
+// Export these so the attach impl can use them (avoid re-entrancy)
+extern "C" {
+    memcpy_fn pgas_orig_memcpy = nullptr;
+    memmove_fn pgas_orig_memmove = nullptr;
+    memset_fn pgas_orig_memset = nullptr;
+}
+
 static malloc_fn orig_malloc = nullptr;
 static free_fn orig_free = nullptr;
 
-// Load configuration from environment or file
+// Aliases for backward compatibility
+#define orig_memcpy pgas_orig_memcpy
+#define orig_memmove pgas_orig_memmove
+#define orig_memset pgas_orig_memset
+
+// Load configuration from file then environment (env overrides file)
 static void load_config() {
-    // Environment variables
+    // Config file first (optional) - environment variables will override
+    const char *config_file = getenv("PGAS_CONFIG");
+    if (config_file) {
+        std::ifstream ifs(config_file);
+        if (ifs.is_open()) {
+            std::string line;
+            while (std::getline(ifs, line)) {
+                if (line.empty() || line[0] == '#') continue;
+
+                std::istringstream iss(line);
+                std::string key, value;
+                if (std::getline(iss, key, '=') && std::getline(iss, value)) {
+                    if (key == "node_id") g_local_node_id = atoi(value.c_str());
+                    else if (key == "num_nodes") g_num_nodes = atoi(value.c_str());
+                    else if (key == "base_addr") g_pgas_base = strtoull(value.c_str(), nullptr, 0);
+                    else if (key == "size") g_pgas_size = strtoull(value.c_str(), nullptr, 0);
+                    else if (key == "verbose") g_verbose = (value == "1" || value == "true");
+                    // CXLMemSim config file options
+                    else if (key == "cxlmemsim_host") strncpy(g_cxlmemsim_host, value.c_str(), sizeof(g_cxlmemsim_host) - 1);
+                    else if (key == "cxlmemsim_port") g_cxlmemsim_port = atoi(value.c_str());
+                }
+            }
+        }
+    }
+
+    // Environment variables override config file
     const char *env_node = getenv("PGAS_NODE_ID");
     if (env_node) {
         g_local_node_id = atoi(env_node);
@@ -89,94 +132,16 @@ static void load_config() {
         g_enable_stats = false;
     }
 
-    // Config file (optional)
-    const char *config_file = getenv("PGAS_CONFIG");
-    if (config_file) {
-        std::ifstream ifs(config_file);
-        if (ifs.is_open()) {
-            std::string line;
-            while (std::getline(ifs, line)) {
-                if (line.empty() || line[0] == '#') continue;
-
-                std::istringstream iss(line);
-                std::string key, value;
-                if (std::getline(iss, key, '=') && std::getline(iss, value)) {
-                    if (key == "node_id") g_local_node_id = atoi(value.c_str());
-                    else if (key == "num_nodes") g_num_nodes = atoi(value.c_str());
-                    else if (key == "base_addr") g_pgas_base = strtoull(value.c_str(), nullptr, 0);
-                    else if (key == "size") g_pgas_size = strtoull(value.c_str(), nullptr, 0);
-                    else if (key == "verbose") g_verbose = (value == "1" || value == "true");
-                }
-            }
-        }
-    }
-}
-
-// PGAS callback for memcpy
-static int pgas_memcpy_callback(void *memory, size_t mem_size, uint64_t *ret) {
-    (void)mem_size;
-    (void)ret;
-    auto *ctx = (pgas_memory_context *)memory;
-
-    g_total_memcpy++;
-    g_bytes_copied += ctx->size;
-
-    if (ctx->is_remote) {
-        g_remote_accesses++;
-        if (g_verbose) {
-            fprintf(stderr, "[PGAS] Remote memcpy: %p <- %p (%zu bytes) -> node %d\n",
-                    ctx->address, ctx->data, ctx->size, ctx->target_node);
-        }
-        // TODO: Implement actual remote memory copy via CXL/RDMA
-        // For now, the override handler performs local copy
-    } else {
-        g_local_accesses++;
+    // CXLMemSim environment variables override config file
+    const char *env_cxl_host = getenv("CXL_MEMSIM_HOST");
+    if (env_cxl_host) {
+        strncpy(g_cxlmemsim_host, env_cxl_host, sizeof(g_cxlmemsim_host) - 1);
     }
 
-    return 0;
-}
-
-// PGAS callback for memmove
-static int pgas_memmove_callback(void *memory, size_t mem_size, uint64_t *ret) {
-    (void)mem_size;
-    (void)ret;
-    auto *ctx = (pgas_memory_context *)memory;
-
-    g_total_memmove++;
-    g_bytes_copied += ctx->size;
-
-    if (ctx->is_remote) {
-        g_remote_accesses++;
-        if (g_verbose) {
-            fprintf(stderr, "[PGAS] Remote memmove: %p <- %p (%zu bytes) -> node %d\n",
-                    ctx->address, ctx->data, ctx->size, ctx->target_node);
-        }
-    } else {
-        g_local_accesses++;
+    const char *env_cxl_port = getenv("CXL_MEMSIM_PORT");
+    if (env_cxl_port) {
+        g_cxlmemsim_port = atoi(env_cxl_port);
     }
-
-    return 0;
-}
-
-// PGAS callback for memset
-static int pgas_memset_callback(void *memory, size_t mem_size, uint64_t *ret) {
-    (void)mem_size;
-    (void)ret;
-    auto *ctx = (pgas_memory_context *)memory;
-
-    g_total_memset++;
-
-    if (ctx->is_remote) {
-        g_remote_accesses++;
-        if (g_verbose) {
-            fprintf(stderr, "[PGAS] Remote memset: %p (%zu bytes) -> node %d\n",
-                    ctx->address, ctx->size, ctx->target_node);
-        }
-    } else {
-        g_local_accesses++;
-    }
-
-    return 0;
 }
 
 // Print statistics
@@ -220,74 +185,38 @@ static void init_pgas() {
     orig_malloc = (malloc_fn)dlsym(RTLD_NEXT, "malloc");
     orig_free = (free_fn)dlsym(RTLD_NEXT, "free");
 
-    // Create PGAS implementation
-    g_pgas_impl = new pgas_attach_impl();
-    g_pgas_impl->set_pgas_region(g_pgas_base, g_pgas_size);
+    // Using direct LD_PRELOAD interposition instead of Frida hooks
+    // The memcpy/memmove/memset functions defined at the bottom of this file
+    // will be called automatically via LD_PRELOAD symbol interposition
+    fprintf(stderr, "[PGAS] Using direct LD_PRELOAD interposition\n");
 
-    // Get addresses to hook
-    void *memcpy_addr = dlsym(RTLD_DEFAULT, "memcpy");
-    void *memmove_addr = dlsym(RTLD_DEFAULT, "memmove");
-    void *memset_addr = dlsym(RTLD_DEFAULT, "memset");
-
-    // Create memcpy hook
-    if (memcpy_addr) {
-        pgas_attach_private_data priv;
-        priv.target_address = memcpy_addr;
-        priv.op_type = pgas_op_type::MEMCPY;
-        priv.local_node_id = g_local_node_id;
-        priv.num_nodes = g_num_nodes;
-        priv.pgas_base_addr = g_pgas_base;
-        priv.pgas_size = g_pgas_size;
-
-        g_memcpy_hook_id = g_pgas_impl->create_attach_with_ebpf_callback(
-            pgas_memcpy_callback, priv, ATTACH_PGAS_MEMCPY);
-
-        if (g_memcpy_hook_id >= 0) {
-            fprintf(stderr, "[PGAS] Hooked memcpy at %p\n", memcpy_addr);
+    // Connect to CXLMemSim server for remote memory access
+    if (g_cxlmemsim_port > 0) {
+        g_cxlmemsim_ctx = (cxlmemsim_ctx_t*)malloc(sizeof(cxlmemsim_ctx_t));
+        if (g_cxlmemsim_ctx) {
+            if (cxlmemsim_init(g_cxlmemsim_ctx, g_cxlmemsim_host, g_cxlmemsim_port) == 0) {
+                if (cxlmemsim_connect(g_cxlmemsim_ctx) == 0) {
+                    g_cxlmemsim_connected = true;
+                    fprintf(stderr, "[PGAS] Connected to CXLMemSim server at %s:%d\n",
+                            g_cxlmemsim_host, g_cxlmemsim_port);
+                } else {
+                    fprintf(stderr, "[PGAS] Warning: Failed to connect to CXLMemSim at %s:%d, "
+                            "remote accesses will use local memory only\n",
+                            g_cxlmemsim_host, g_cxlmemsim_port);
+                }
+            } else {
+                fprintf(stderr, "[PGAS] Warning: Failed to initialize CXLMemSim client\n");
+            }
         }
-    }
-
-    // Create memmove hook
-    if (memmove_addr && memmove_addr != memcpy_addr) {
-        pgas_attach_private_data priv;
-        priv.target_address = memmove_addr;
-        priv.op_type = pgas_op_type::MEMMOVE;
-        priv.local_node_id = g_local_node_id;
-        priv.num_nodes = g_num_nodes;
-        priv.pgas_base_addr = g_pgas_base;
-        priv.pgas_size = g_pgas_size;
-
-        g_memmove_hook_id = g_pgas_impl->create_attach_with_ebpf_callback(
-            pgas_memmove_callback, priv, ATTACH_PGAS_MEMMOVE);
-
-        if (g_memmove_hook_id >= 0) {
-            fprintf(stderr, "[PGAS] Hooked memmove at %p\n", memmove_addr);
-        }
-    }
-
-    // Create memset hook
-    if (memset_addr) {
-        pgas_attach_private_data priv;
-        priv.target_address = memset_addr;
-        priv.op_type = pgas_op_type::MEMSET;
-        priv.local_node_id = g_local_node_id;
-        priv.num_nodes = g_num_nodes;
-        priv.pgas_base_addr = g_pgas_base;
-        priv.pgas_size = g_pgas_size;
-
-        g_memset_hook_id = g_pgas_impl->create_attach_with_ebpf_callback(
-            pgas_memset_callback, priv, ATTACH_PGAS_MEMSET);
-
-        if (g_memset_hook_id >= 0) {
-            fprintf(stderr, "[PGAS] Hooked memset at %p\n", memset_addr);
-        }
+    } else {
+        fprintf(stderr, "[PGAS] CXLMemSim disabled (port=0), using local memory only\n");
     }
 
     g_initialized = true;
     fprintf(stderr, "[PGAS] Initialization complete\n");
 }
 
-// Cleanup PGAS hooks
+// Cleanup PGAS
 static void cleanup_pgas() {
     std::lock_guard<std::mutex> lock(g_mutex);
 
@@ -295,24 +224,32 @@ static void cleanup_pgas() {
 
     fprintf(stderr, "[PGAS] Shutting down...\n");
 
+    // Print CXLMemSim statistics if connected
+    if (g_cxlmemsim_connected && g_cxlmemsim_ctx) {
+        cxlmemsim_stats_t cxl_stats;
+        cxlmemsim_get_stats(g_cxlmemsim_ctx, &cxl_stats);
+        fprintf(stderr, "\n=== CXLMemSim Statistics ===\n");
+        fprintf(stderr, "Total reads: %lu\n", cxl_stats.total_reads);
+        fprintf(stderr, "Total writes: %lu\n", cxl_stats.total_writes);
+        fprintf(stderr, "Total bytes read: %lu\n", cxl_stats.total_bytes_read);
+        fprintf(stderr, "Total bytes written: %lu\n", cxl_stats.total_bytes_written);
+        fprintf(stderr, "Total latency: %lu ns\n", cxl_stats.total_latency_ns);
+        fprintf(stderr, "============================\n");
+    }
+
+    // Disconnect from CXLMemSim server
+    if (g_cxlmemsim_ctx) {
+        if (g_cxlmemsim_connected) {
+            cxlmemsim_disconnect(g_cxlmemsim_ctx);
+            g_cxlmemsim_connected = false;
+        }
+        cxlmemsim_finalize(g_cxlmemsim_ctx);
+        free(g_cxlmemsim_ctx);
+        g_cxlmemsim_ctx = nullptr;
+    }
+
     // Print statistics
     print_stats();
-
-    // Detach hooks
-    if (g_pgas_impl) {
-        if (g_memcpy_hook_id >= 0) {
-            g_pgas_impl->detach_by_id(g_memcpy_hook_id);
-        }
-        if (g_memmove_hook_id >= 0) {
-            g_pgas_impl->detach_by_id(g_memmove_hook_id);
-        }
-        if (g_memset_hook_id >= 0) {
-            g_pgas_impl->detach_by_id(g_memset_hook_id);
-        }
-
-        delete g_pgas_impl;
-        g_pgas_impl = nullptr;
-    }
 
     g_initialized = false;
     fprintf(stderr, "[PGAS] Shutdown complete\n");
@@ -381,3 +318,209 @@ void pgas_get_config(uint16_t *node_id, uint16_t *num_nodes,
 }
 
 } // extern "C"
+
+// =============================================================================
+// Direct LD_PRELOAD interposition (no Frida hooks needed)
+// These override libc's memcpy/memmove/memset directly
+// =============================================================================
+
+// Helper to check if address is in PGAS region
+static inline bool is_pgas_addr(const void *addr) {
+    uintptr_t a = (uintptr_t)addr;
+    return a >= g_pgas_base && a < g_pgas_base + g_pgas_size;
+}
+
+// Helper to route address to node
+static inline uint16_t route_to_node(uintptr_t addr) {
+    if (g_num_nodes <= 1) return g_local_node_id;
+    if (!is_pgas_addr((void*)addr)) return g_local_node_id;
+
+    uint64_t offset = addr - g_pgas_base;
+    uint64_t region_size = g_pgas_size / g_num_nodes;
+    return (uint16_t)(offset / region_size) % g_num_nodes;
+}
+
+extern "C" void *memcpy(void *dest, const void *src, size_t n) {
+    // Ensure we have the original function
+    if (!pgas_orig_memcpy) {
+        pgas_orig_memcpy = (memcpy_fn)dlsym(RTLD_NEXT, "memcpy");
+    }
+
+    if (g_initialized) {
+        g_total_memcpy++;
+        g_bytes_copied += n;
+
+        bool dest_pgas = is_pgas_addr(dest);
+        bool src_pgas = is_pgas_addr(src);
+
+        if (dest_pgas || src_pgas) {
+            uint16_t dest_node = dest_pgas ? route_to_node((uintptr_t)dest) : g_local_node_id;
+            uint16_t src_node = src_pgas ? route_to_node((uintptr_t)src) : g_local_node_id;
+
+            bool dest_remote = (dest_node != g_local_node_id);
+            bool src_remote = (src_node != g_local_node_id);
+
+            if (dest_remote || src_remote) {
+                g_remote_accesses++;
+                if (g_verbose) {
+                    fprintf(stderr, "[PGAS] Remote memcpy: %p <- %p (%zu bytes) dest_node=%d src_node=%d\n",
+                            dest, src, n, dest_node, src_node);
+                }
+
+                // Route through CXLMemSim if connected
+                if (g_cxlmemsim_connected && g_cxlmemsim_ctx) {
+                    if (src_remote && dest_remote) {
+                        // Both remote: read from src via CXLMemSim, write to dest via CXLMemSim
+                        // Use local buffer for transfer
+                        char *temp_buf = (char*)pgas_orig_memcpy(nullptr, nullptr, 0);  // Get aligned temp
+                        temp_buf = (char*)alloca(n < 4096 ? n : 4096);
+
+                        size_t remaining = n;
+                        size_t offset = 0;
+                        while (remaining > 0) {
+                            size_t chunk = remaining > 4096 ? 4096 : remaining;
+                            cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src + offset, temp_buf, chunk);
+                            cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest + offset, temp_buf, chunk);
+                            offset += chunk;
+                            remaining -= chunk;
+                        }
+                        return dest;
+                    } else if (src_remote) {
+                        // Source is remote: load from CXLMemSim to local dest
+                        if (cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src, dest, n) == 0) {
+                            return dest;
+                        }
+                        // Fall through to local memcpy on failure
+                    } else if (dest_remote) {
+                        // Dest is remote: store to CXLMemSim from local src
+                        if (cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest, src, n) == 0) {
+                            return dest;
+                        }
+                        // Fall through to local memcpy on failure
+                    }
+                }
+            } else {
+                g_local_accesses++;
+            }
+        } else {
+            g_local_accesses++;
+        }
+    }
+
+    return pgas_orig_memcpy(dest, src, n);
+}
+
+extern "C" void *memmove(void *dest, const void *src, size_t n) {
+    if (!pgas_orig_memmove) {
+        pgas_orig_memmove = (memmove_fn)dlsym(RTLD_NEXT, "memmove");
+    }
+
+    if (g_initialized) {
+        g_total_memmove++;
+        g_bytes_copied += n;
+
+        bool dest_pgas = is_pgas_addr(dest);
+        bool src_pgas = is_pgas_addr(src);
+
+        if (dest_pgas || src_pgas) {
+            uint16_t dest_node = dest_pgas ? route_to_node((uintptr_t)dest) : g_local_node_id;
+            uint16_t src_node = src_pgas ? route_to_node((uintptr_t)src) : g_local_node_id;
+
+            bool dest_remote = (dest_node != g_local_node_id);
+            bool src_remote = (src_node != g_local_node_id);
+
+            if (dest_remote || src_remote) {
+                g_remote_accesses++;
+                if (g_verbose) {
+                    fprintf(stderr, "[PGAS] Remote memmove: %p <- %p (%zu bytes) dest_node=%d src_node=%d\n",
+                            dest, src, n, dest_node, src_node);
+                }
+
+                // Route through CXLMemSim if connected
+                if (g_cxlmemsim_connected && g_cxlmemsim_ctx) {
+                    if (src_remote && dest_remote) {
+                        // Both remote: read from src via CXLMemSim, write to dest via CXLMemSim
+                        char *temp_buf = (char*)alloca(n < 4096 ? n : 4096);
+
+                        size_t remaining = n;
+                        size_t offset = 0;
+                        while (remaining > 0) {
+                            size_t chunk = remaining > 4096 ? 4096 : remaining;
+                            cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src + offset, temp_buf, chunk);
+                            cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest + offset, temp_buf, chunk);
+                            offset += chunk;
+                            remaining -= chunk;
+                        }
+                        return dest;
+                    } else if (src_remote) {
+                        // Source is remote: load from CXLMemSim to local dest
+                        if (cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src, dest, n) == 0) {
+                            return dest;
+                        }
+                    } else if (dest_remote) {
+                        // Dest is remote: store to CXLMemSim from local src
+                        if (cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest, src, n) == 0) {
+                            return dest;
+                        }
+                    }
+                }
+            } else {
+                g_local_accesses++;
+            }
+        } else {
+            g_local_accesses++;
+        }
+    }
+
+    return pgas_orig_memmove(dest, src, n);
+}
+
+extern "C" void *memset(void *s, int c, size_t n) {
+    if (!pgas_orig_memset) {
+        pgas_orig_memset = (memset_fn)dlsym(RTLD_NEXT, "memset");
+    }
+
+    if (g_initialized) {
+        g_total_memset++;
+
+        if (is_pgas_addr(s)) {
+            uint16_t target = route_to_node((uintptr_t)s);
+            if (target != g_local_node_id) {
+                g_remote_accesses++;
+                if (g_verbose) {
+                    fprintf(stderr, "[PGAS] Remote memset: %p (%zu bytes) -> node %d\n",
+                            s, n, target);
+                }
+
+                // Route through CXLMemSim if connected
+                if (g_cxlmemsim_connected && g_cxlmemsim_ctx) {
+                    // Create a buffer filled with the byte value and send to remote
+                    size_t chunk_size = 4096;
+                    char *temp_buf = (char*)alloca(chunk_size);
+                    pgas_orig_memset(temp_buf, c, chunk_size);
+
+                    size_t remaining = n;
+                    size_t offset = 0;
+                    while (remaining > 0) {
+                        size_t chunk = remaining > chunk_size ? chunk_size : remaining;
+                        if (cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)s + offset, temp_buf, chunk) != 0) {
+                            // Failed, fall through to local memset
+                            break;
+                        }
+                        offset += chunk;
+                        remaining -= chunk;
+                    }
+                    if (remaining == 0) {
+                        return s;
+                    }
+                }
+            } else {
+                g_local_accesses++;
+            }
+        } else {
+            g_local_accesses++;
+        }
+    }
+
+    return pgas_orig_memset(s, c, n);
+}

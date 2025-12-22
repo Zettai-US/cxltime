@@ -24,6 +24,13 @@ extern "C" void *pgas_memcpy_override_handler();
 extern "C" void *pgas_memmove_override_handler();
 extern "C" void *pgas_memset_override_handler();
 
+// Import original function pointers from pgas_preload (set before hooks are installed)
+extern "C" {
+    extern void* (*pgas_orig_memcpy)(void*, const void*, size_t);
+    extern void* (*pgas_orig_memmove)(void*, const void*, size_t);
+    extern void* (*pgas_orig_memset)(void*, int, size_t);
+}
+
 // Frida listener interface - use simple struct approach like frida_uprobe_attach_impl
 struct _PgasListener {
     GObject parent;
@@ -91,7 +98,13 @@ pgas_internal_attach_entry::pgas_internal_attach_entry(
     : function(func), listener(nullptr),
       local_node_id(local_node), num_nodes(num_nodes),
       pgas_base_addr(base_addr), pgas_size(size),
-      is_overrided(false), user_ret(0) {}
+      is_overrided(false), user_ret(0),
+      orig_memcpy(nullptr), orig_memmove(nullptr), orig_memset(nullptr) {
+    // Get original function pointers using RTLD_NEXT to avoid re-entrancy
+    orig_memcpy = (void *(*)(void *, const void *, size_t))dlsym(RTLD_NEXT, "memcpy");
+    orig_memmove = (void *(*)(void *, const void *, size_t))dlsym(RTLD_NEXT, "memmove");
+    orig_memset = (void *(*)(void *, int, size_t))dlsym(RTLD_NEXT, "memset");
+}
 
 pgas_internal_attach_entry::~pgas_internal_attach_entry() {
     if (listener) {
@@ -113,7 +126,12 @@ uint16_t pgas_internal_attach_entry::route_to_node(uint64_t addr) const {
     if (num_nodes <= 1) return local_node_id;
     if (pgas_size == 0) return local_node_id;
 
-    // Simple hash-based routing
+    // Check if address is within PGAS region
+    if (addr < pgas_base_addr || addr >= pgas_base_addr + pgas_size) {
+        return local_node_id;  // Not in PGAS region, treat as local
+    }
+
+    // Simple hash-based routing within PGAS region
     uint64_t offset = addr - pgas_base_addr;
     uint64_t region_size = pgas_size / num_nodes;
     return (uint16_t)(offset / region_size) % num_nodes;
@@ -269,8 +287,17 @@ extern "C" void *pgas_memcpy_override_handler() {
         // For demonstration, fall through to local copy
     }
 
-    // Perform the actual memcpy
-    return memcpy(dest, src, n);
+    // Perform the actual memcpy using original function to avoid re-entrancy
+    if (pgas_orig_memcpy) {
+        return pgas_orig_memcpy(dest, src, n);
+    }
+    // Fallback: inline copy if orig_memcpy not available
+    char *d = (char *)dest;
+    const char *s = (const char *)src;
+    for (size_t i = 0; i < n; i++) {
+        d[i] = s[i];
+    }
+    return dest;
 }
 
 extern "C" void *pgas_memmove_override_handler() {
@@ -308,7 +335,19 @@ extern "C" void *pgas_memmove_override_handler() {
         }
     }
 
-    return memmove(dest, src, n);
+    // Use original function to avoid re-entrancy
+    if (pgas_orig_memmove) {
+        return pgas_orig_memmove(dest, src, n);
+    }
+    // Fallback: safe byte-by-byte copy
+    char *d = (char *)dest;
+    const char *s = (const char *)src;
+    if (d < s) {
+        for (size_t i = 0; i < n; i++) d[i] = s[i];
+    } else {
+        for (size_t i = n; i > 0; i--) d[i-1] = s[i-1];
+    }
+    return dest;
 }
 
 extern "C" void *pgas_memset_override_handler() {
@@ -346,7 +385,16 @@ extern "C" void *pgas_memset_override_handler() {
         }
     }
 
-    return memset(s, c, n);
+    // Use original function to avoid re-entrancy
+    if (pgas_orig_memset) {
+        return pgas_orig_memset(s, c, n);
+    }
+    // Fallback: inline memset
+    unsigned char *p = (unsigned char *)s;
+    for (size_t i = 0; i < n; i++) {
+        p[i] = (unsigned char)c;
+    }
+    return s;
 }
 
 // pgas_attach_impl implementation
