@@ -17,6 +17,7 @@
 // CXLMemSim client for remote memory access (from libpgas)
 extern "C" {
 #include "pgas/cxlmemsim_client.h"
+#include "pgas/pgas.h"  // For pgas_region_info_t
 }
 
 // Global state
@@ -30,6 +31,15 @@ static uint64_t g_pgas_base = 0;
 static uint64_t g_pgas_size = 1ULL << 30;  // 1GB default
 static bool g_verbose = false;
 static bool g_enable_stats = true;
+
+// =============================================================================
+// Dynamic PGAS region registration (populated by libpgas at runtime)
+// =============================================================================
+#define MAX_PGAS_REGIONS 16
+static std::mutex g_region_mutex;
+static pgas_region_info_t g_registered_regions[MAX_PGAS_REGIONS];
+static int g_num_registered_regions = 0;
+static bool g_regions_initialized = false;  // True once libpgas registers regions
 
 // CXLMemSim configuration
 static char g_cxlmemsim_host[256] = "localhost";
@@ -73,6 +83,90 @@ static free_fn orig_free = nullptr;
 #define orig_memcpy pgas_orig_memcpy
 #define orig_memmove pgas_orig_memmove
 #define orig_memset pgas_orig_memset
+
+// =============================================================================
+// PGAS Region Registration API (called by libpgas)
+// These override the weak symbols in libpgas
+// =============================================================================
+
+extern "C" {
+
+void pgas_register_region(const pgas_region_info_t* region) {
+    if (!region) return;
+
+    std::lock_guard<std::mutex> lock(g_region_mutex);
+
+    // Check if region already exists (update it)
+    for (int i = 0; i < g_num_registered_regions; i++) {
+        if (g_registered_regions[i].node_id == region->node_id) {
+            g_registered_regions[i] = *region;
+            if (g_verbose) {
+                fprintf(stderr, "[PGAS] Updated region for node %d: base=0x%lx size=%lu local=%d\n",
+                        region->node_id, region->base_addr, region->size, region->is_local);
+            }
+            // Update local node info if this is our node
+            if (region->is_local) {
+                g_local_node_id = region->node_id;
+            }
+            g_regions_initialized = true;
+            return;
+        }
+    }
+
+    // Add new region
+    if (g_num_registered_regions < MAX_PGAS_REGIONS) {
+        g_registered_regions[g_num_registered_regions++] = *region;
+        if (region->is_local) {
+            g_local_node_id = region->node_id;
+        }
+        g_num_nodes = g_num_registered_regions;
+        g_regions_initialized = true;
+
+        if (g_verbose) {
+            fprintf(stderr, "[PGAS] Registered region for node %d: base=0x%lx size=%lu local=%d\n",
+                    region->node_id, region->base_addr, region->size, region->is_local);
+        }
+    } else {
+        fprintf(stderr, "[PGAS] Warning: Max regions (%d) reached, cannot register node %d\n",
+                MAX_PGAS_REGIONS, region->node_id);
+    }
+}
+
+void pgas_unregister_region(uint16_t node_id) {
+    std::lock_guard<std::mutex> lock(g_region_mutex);
+
+    for (int i = 0; i < g_num_registered_regions; i++) {
+        if (g_registered_regions[i].node_id == node_id) {
+            // Shift remaining regions down
+            for (int j = i; j < g_num_registered_regions - 1; j++) {
+                g_registered_regions[j] = g_registered_regions[j + 1];
+            }
+            g_num_registered_regions--;
+            g_num_nodes = g_num_registered_regions;
+
+            if (g_verbose) {
+                fprintf(stderr, "[PGAS] Unregistered region for node %d\n", node_id);
+            }
+
+            if (g_num_registered_regions == 0) {
+                g_regions_initialized = false;
+            }
+            return;
+        }
+    }
+}
+
+int pgas_get_registered_regions(pgas_region_info_t* regions, int max_regions) {
+    std::lock_guard<std::mutex> lock(g_region_mutex);
+
+    int count = (g_num_registered_regions < max_regions) ? g_num_registered_regions : max_regions;
+    for (int i = 0; i < count; i++) {
+        regions[i] = g_registered_regions[i];
+    }
+    return count;
+}
+
+}  // extern "C"
 
 // Load configuration from file then environment (env overrides file)
 static void load_config() {
@@ -276,10 +370,10 @@ extern "C" void pgas_signal_handler(int sig) {
 // API for runtime control
 extern "C" {
 
-// Get current statistics
-void pgas_get_stats(uint64_t *memcpy_calls, uint64_t *memmove_calls,
-                    uint64_t *memset_calls, uint64_t *bytes_copied,
-                    uint64_t *local_accesses, uint64_t *remote_accesses) {
+// Get current statistics (renamed to avoid conflict with pgas.h)
+void pgas_preload_get_stats(uint64_t *memcpy_calls, uint64_t *memmove_calls,
+                            uint64_t *memset_calls, uint64_t *bytes_copied,
+                            uint64_t *local_accesses, uint64_t *remote_accesses) {
     if (memcpy_calls) *memcpy_calls = g_total_memcpy.load();
     if (memmove_calls) *memmove_calls = g_total_memmove.load();
     if (memset_calls) *memset_calls = g_total_memset.load();
@@ -288,8 +382,8 @@ void pgas_get_stats(uint64_t *memcpy_calls, uint64_t *memmove_calls,
     if (remote_accesses) *remote_accesses = g_remote_accesses.load();
 }
 
-// Reset statistics
-void pgas_reset_stats() {
+// Reset statistics (renamed to avoid conflict with pgas.h)
+void pgas_preload_reset_stats() {
     g_total_memcpy = 0;
     g_total_memmove = 0;
     g_total_memset = 0;
@@ -324,17 +418,48 @@ void pgas_get_config(uint16_t *node_id, uint16_t *num_nodes,
 // These override libc's memcpy/memmove/memset directly
 // =============================================================================
 
-// Helper to check if address is in PGAS region
+// Helper to check if address is in any PGAS region
+// Uses dynamically registered regions from libpgas if available,
+// otherwise falls back to static configuration
 static inline bool is_pgas_addr(const void *addr) {
     uintptr_t a = (uintptr_t)addr;
+
+    // If libpgas has registered regions, use those (dynamic mode)
+    if (g_regions_initialized) {
+        for (int i = 0; i < g_num_registered_regions; i++) {
+            uint64_t base = g_registered_regions[i].base_addr;
+            uint64_t size = g_registered_regions[i].size;
+            if (a >= base && a < base + size) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Fallback to static configuration (for standalone use without libpgas)
     return a >= g_pgas_base && a < g_pgas_base + g_pgas_size;
 }
 
 // Helper to route address to node
+// Uses dynamically registered regions from libpgas if available
 static inline uint16_t route_to_node(uintptr_t addr) {
     if (g_num_nodes <= 1) return g_local_node_id;
     if (!is_pgas_addr((void*)addr)) return g_local_node_id;
 
+    // If libpgas has registered regions, find which node owns this address
+    if (g_regions_initialized) {
+        for (int i = 0; i < g_num_registered_regions; i++) {
+            uint64_t base = g_registered_regions[i].base_addr;
+            uint64_t size = g_registered_regions[i].size;
+            if (addr >= base && addr < base + size) {
+                return g_registered_regions[i].node_id;
+            }
+        }
+        // Address not in any registered region
+        return g_local_node_id;
+    }
+
+    // Fallback to static configuration (divide PGAS space evenly)
     uint64_t offset = addr - g_pgas_base;
     uint64_t region_size = g_pgas_size / g_num_nodes;
     return (uint16_t)(offset / region_size) % g_num_nodes;
@@ -362,45 +487,47 @@ extern "C" void *memcpy(void *dest, const void *src, size_t n) {
 
             if (dest_remote || src_remote) {
                 g_remote_accesses++;
-                if (g_verbose) {
-                    fprintf(stderr, "[PGAS] Remote memcpy: %p <- %p (%zu bytes) dest_node=%d src_node=%d\n",
-                            dest, src, n, dest_node, src_node);
-                }
-
-                // Route through CXLMemSim if connected
-                if (g_cxlmemsim_connected && g_cxlmemsim_ctx) {
-                    if (src_remote && dest_remote) {
-                        // Both remote: read from src via CXLMemSim, write to dest via CXLMemSim
-                        // Use local buffer for transfer
-                        char *temp_buf = (char*)pgas_orig_memcpy(nullptr, nullptr, 0);  // Get aligned temp
-                        temp_buf = (char*)alloca(n < 4096 ? n : 4096);
-
-                        size_t remaining = n;
-                        size_t offset = 0;
-                        while (remaining > 0) {
-                            size_t chunk = remaining > 4096 ? 4096 : remaining;
-                            cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src + offset, temp_buf, chunk);
-                            cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest + offset, temp_buf, chunk);
-                            offset += chunk;
-                            remaining -= chunk;
-                        }
-                        return dest;
-                    } else if (src_remote) {
-                        // Source is remote: load from CXLMemSim to local dest
-                        if (cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src, dest, n) == 0) {
-                            return dest;
-                        }
-                        // Fall through to local memcpy on failure
-                    } else if (dest_remote) {
-                        // Dest is remote: store to CXLMemSim from local src
-                        if (cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest, src, n) == 0) {
-                            return dest;
-                        }
-                        // Fall through to local memcpy on failure
-                    }
-                }
             } else {
                 g_local_accesses++;
+            }
+
+            if (g_verbose) {
+                fprintf(stderr, "[PGAS] CXL memcpy: %p <- %p (%zu bytes) dest_node=%d src_node=%d\n",
+                        dest, src, n, dest_node, src_node);
+            }
+
+            // Route ALL CXL memory accesses through CXLMemSim if connected
+            // This tracks both local and remote CXL accesses for latency simulation
+            if (g_cxlmemsim_connected && g_cxlmemsim_ctx) {
+                if (src_pgas && dest_pgas) {
+                    // Both in CXL memory: read from src, write to dest via CXLMemSim
+                    char *temp_buf = (char*)alloca(n < 4096 ? n : 4096);
+
+                    size_t remaining = n;
+                    size_t offset = 0;
+                    while (remaining > 0) {
+                        size_t chunk = remaining > 4096 ? 4096 : remaining;
+                        cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src + offset, temp_buf, chunk);
+                        cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest + offset, temp_buf, chunk);
+                        offset += chunk;
+                        remaining -= chunk;
+                    }
+                    // Also do actual memcpy for data integrity
+                    pgas_orig_memcpy(dest, src, n);
+                    return dest;
+                } else if (src_pgas) {
+                    // Source is in CXL memory: track the read via CXLMemSim
+                    cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src, dest, n);
+                    // Also do actual memcpy for data integrity
+                    pgas_orig_memcpy(dest, src, n);
+                    return dest;
+                } else if (dest_pgas) {
+                    // Dest is in CXL memory: track the write via CXLMemSim
+                    cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest, src, n);
+                    // Also do actual memcpy for data integrity
+                    pgas_orig_memcpy(dest, src, n);
+                    return dest;
+                }
             }
         } else {
             g_local_accesses++;
@@ -431,41 +558,43 @@ extern "C" void *memmove(void *dest, const void *src, size_t n) {
 
             if (dest_remote || src_remote) {
                 g_remote_accesses++;
-                if (g_verbose) {
-                    fprintf(stderr, "[PGAS] Remote memmove: %p <- %p (%zu bytes) dest_node=%d src_node=%d\n",
-                            dest, src, n, dest_node, src_node);
-                }
-
-                // Route through CXLMemSim if connected
-                if (g_cxlmemsim_connected && g_cxlmemsim_ctx) {
-                    if (src_remote && dest_remote) {
-                        // Both remote: read from src via CXLMemSim, write to dest via CXLMemSim
-                        char *temp_buf = (char*)alloca(n < 4096 ? n : 4096);
-
-                        size_t remaining = n;
-                        size_t offset = 0;
-                        while (remaining > 0) {
-                            size_t chunk = remaining > 4096 ? 4096 : remaining;
-                            cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src + offset, temp_buf, chunk);
-                            cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest + offset, temp_buf, chunk);
-                            offset += chunk;
-                            remaining -= chunk;
-                        }
-                        return dest;
-                    } else if (src_remote) {
-                        // Source is remote: load from CXLMemSim to local dest
-                        if (cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src, dest, n) == 0) {
-                            return dest;
-                        }
-                    } else if (dest_remote) {
-                        // Dest is remote: store to CXLMemSim from local src
-                        if (cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest, src, n) == 0) {
-                            return dest;
-                        }
-                    }
-                }
             } else {
                 g_local_accesses++;
+            }
+
+            if (g_verbose) {
+                fprintf(stderr, "[PGAS] CXL memmove: %p <- %p (%zu bytes) dest_node=%d src_node=%d\n",
+                        dest, src, n, dest_node, src_node);
+            }
+
+            // Route ALL CXL memory accesses through CXLMemSim if connected
+            if (g_cxlmemsim_connected && g_cxlmemsim_ctx) {
+                if (src_pgas && dest_pgas) {
+                    // Both in CXL memory: read from src, write to dest via CXLMemSim
+                    char *temp_buf = (char*)alloca(n < 4096 ? n : 4096);
+
+                    size_t remaining = n;
+                    size_t offset = 0;
+                    while (remaining > 0) {
+                        size_t chunk = remaining > 4096 ? 4096 : remaining;
+                        cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src + offset, temp_buf, chunk);
+                        cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest + offset, temp_buf, chunk);
+                        offset += chunk;
+                        remaining -= chunk;
+                    }
+                    pgas_orig_memmove(dest, src, n);
+                    return dest;
+                } else if (src_pgas) {
+                    // Source is in CXL memory: track the read via CXLMemSim
+                    cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src, dest, n);
+                    pgas_orig_memmove(dest, src, n);
+                    return dest;
+                } else if (dest_pgas) {
+                    // Dest is in CXL memory: track the write via CXLMemSim
+                    cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest, src, n);
+                    pgas_orig_memmove(dest, src, n);
+                    return dest;
+                }
             }
         } else {
             g_local_accesses++;
@@ -487,35 +616,33 @@ extern "C" void *memset(void *s, int c, size_t n) {
             uint16_t target = route_to_node((uintptr_t)s);
             if (target != g_local_node_id) {
                 g_remote_accesses++;
-                if (g_verbose) {
-                    fprintf(stderr, "[PGAS] Remote memset: %p (%zu bytes) -> node %d\n",
-                            s, n, target);
-                }
-
-                // Route through CXLMemSim if connected
-                if (g_cxlmemsim_connected && g_cxlmemsim_ctx) {
-                    // Create a buffer filled with the byte value and send to remote
-                    size_t chunk_size = 4096;
-                    char *temp_buf = (char*)alloca(chunk_size);
-                    pgas_orig_memset(temp_buf, c, chunk_size);
-
-                    size_t remaining = n;
-                    size_t offset = 0;
-                    while (remaining > 0) {
-                        size_t chunk = remaining > chunk_size ? chunk_size : remaining;
-                        if (cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)s + offset, temp_buf, chunk) != 0) {
-                            // Failed, fall through to local memset
-                            break;
-                        }
-                        offset += chunk;
-                        remaining -= chunk;
-                    }
-                    if (remaining == 0) {
-                        return s;
-                    }
-                }
             } else {
                 g_local_accesses++;
+            }
+
+            if (g_verbose) {
+                fprintf(stderr, "[PGAS] CXL memset: %p (%zu bytes) -> node %d\n",
+                        s, n, target);
+            }
+
+            // Route ALL CXL memory writes through CXLMemSim if connected
+            if (g_cxlmemsim_connected && g_cxlmemsim_ctx) {
+                // Create a buffer filled with the byte value and send to CXLMemSim
+                size_t chunk_size = 4096;
+                char *temp_buf = (char*)alloca(chunk_size);
+                pgas_orig_memset(temp_buf, c, chunk_size);
+
+                size_t remaining = n;
+                size_t offset = 0;
+                while (remaining > 0) {
+                    size_t chunk = remaining > chunk_size ? chunk_size : remaining;
+                    cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)s + offset, temp_buf, chunk);
+                    offset += chunk;
+                    remaining -= chunk;
+                }
+                // Also do actual memset for data integrity
+                pgas_orig_memset(s, c, n);
+                return s;
             }
         } else {
             g_local_accesses++;

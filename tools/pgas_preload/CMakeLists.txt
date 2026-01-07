@@ -1,17 +1,35 @@
 cmake_minimum_required(VERSION 3.15)
 
 # PGAS LD_PRELOAD library for memcached
+# Include CXLMemSim client source directly
+# Handle both standalone and subdirectory builds
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../src/libpgas/src/cxlmemsim_client.c")
+    set(CXLMEMSIM_CLIENT_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../../../../src/libpgas/src/cxlmemsim_client.c)
+else()
+    set(CXLMEMSIM_CLIENT_SRC ${CMAKE_SOURCE_DIR}/src/libpgas/src/cxlmemsim_client.c)
+endif()
+
 add_library(pgas_preload SHARED
     pgas_preload.cpp
+    ${CXLMEMSIM_CLIENT_SRC}
 )
 
 # Include directories
+# Determine libpgas include path
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../src/libpgas/include")
+    set(LIBPGAS_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/../../../../src/libpgas/include)
+else()
+    set(LIBPGAS_INCLUDE ${CMAKE_SOURCE_DIR}/src/libpgas/include)
+endif()
+
 target_include_directories(pgas_preload PRIVATE
     ${CMAKE_SOURCE_DIR}/attach/pgas_attach_impl/include
     ${CMAKE_SOURCE_DIR}/attach/base_attach_impl
     ${CMAKE_SOURCE_DIR}/attach/frida_uprobe_attach_impl/include
     ${SPDLOG_INCLUDE}
     ${FRIDA_GUM_INSTALL_DIR}
+    # CXLMemSim client from libpgas
+    ${LIBPGAS_INCLUDE}
 )
 
 # Link dependencies
