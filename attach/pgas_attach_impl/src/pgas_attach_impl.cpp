@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // PGAS Attach Implementation using Frida
 #include "pgas_attach_impl.hpp"
+#include "pgas_cxlmemsim_integration.hpp"
 #include "frida_register_def.hpp"
 #include <spdlog/spdlog.h>
 #include <cstring>
@@ -274,20 +275,27 @@ extern "C" void *pgas_memcpy_override_handler() {
     // Execute callbacks
     entry->execute_memcpy_callbacks(dest, src, n);
 
-    // Check if this is a remote access
-    uint16_t target_node = entry->route_to_node((uint64_t)dest);
+    // Check if dest or src falls in the PGAS region -> route through CXLMemSim
+    uint16_t dest_node = entry->route_to_node((uint64_t)dest);
+    uint16_t src_node = entry->route_to_node((uint64_t)src);
 
-    if (target_node != entry->local_node_id) {
-        // Remote access - would need to route through network
-        // For now, log and perform local copy
-        SPDLOG_DEBUG("PGAS remote memcpy: dest={} src={} size={} target_node={}",
-                     dest, src, n, target_node);
-
-        // TODO: Implement actual remote memory copy via CXL/network
-        // For demonstration, fall through to local copy
+    if (dest_node != entry->local_node_id) {
+        // Destination is remote: write local src data to remote dest
+        SPDLOG_DEBUG("PGAS remote memcpy (store): dest={} src={} size={} target_node={}",
+                     dest, src, n, dest_node);
+        pgas_remote_memcpy_handler(dest, src, n, dest_node, /*dest_is_remote=*/true);
+        return dest;
     }
 
-    // Perform the actual memcpy using original function to avoid re-entrancy
+    if (src_node != entry->local_node_id) {
+        // Source is remote: read from remote src into local dest
+        SPDLOG_DEBUG("PGAS remote memcpy (load): dest={} src={} size={} target_node={}",
+                     dest, src, n, src_node);
+        pgas_remote_memcpy_handler(dest, src, n, src_node, /*dest_is_remote=*/false);
+        return dest;
+    }
+
+    // Both local - perform the actual memcpy using original function
     if (pgas_orig_memcpy) {
         return pgas_orig_memcpy(dest, src, n);
     }
@@ -335,7 +343,21 @@ extern "C" void *pgas_memmove_override_handler() {
         }
     }
 
-    // Use original function to avoid re-entrancy
+    // Route remote accesses through CXLMemSim
+    if (mem_ctx.is_remote) {
+        uint16_t dest_node = entry->route_to_node((uint64_t)dest);
+        uint16_t src_node = entry->route_to_node((uint64_t)src);
+        if (dest_node != entry->local_node_id) {
+            pgas_remote_memcpy_handler(dest, src, n, dest_node, true);
+            return dest;
+        }
+        if (src_node != entry->local_node_id) {
+            pgas_remote_memcpy_handler(dest, src, n, src_node, false);
+            return dest;
+        }
+    }
+
+    // Both local - use original function
     if (pgas_orig_memmove) {
         return pgas_orig_memmove(dest, src, n);
     }
@@ -385,7 +407,13 @@ extern "C" void *pgas_memset_override_handler() {
         }
     }
 
-    // Use original function to avoid re-entrancy
+    // Route remote memset through CXLMemSim
+    if (mem_ctx.is_remote) {
+        pgas_remote_memset_handler(s, c, n, mem_ctx.target_node);
+        return s;
+    }
+
+    // Local - use original function
     if (pgas_orig_memset) {
         return pgas_orig_memset(s, c, n);
     }
