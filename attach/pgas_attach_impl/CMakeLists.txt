@@ -4,12 +4,14 @@ cmake_minimum_required(VERSION 3.15)
 set(PGAS_ATTACH_SOURCES
     src/pgas_attach_impl.cpp
     src/pgas_cxlmemsim_integration.cpp
+    src/pgas_stalker_mov.cpp
 )
 
 set(PGAS_ATTACH_HEADERS
     include/pgas_attach_impl.hpp
     include/pgas_attach_private_data.hpp
     include/pgas_cxlmemsim_integration.hpp
+    include/pgas_stalker_mov.hpp
 )
 
 # CXLMemSim client library path (from libpgas)
