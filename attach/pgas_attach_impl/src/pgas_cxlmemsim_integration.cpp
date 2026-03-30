@@ -174,6 +174,10 @@ int pgas_cxlmemsim_hooker::remote_read(uint16_t node_id, uint64_t addr,
     if (conn_mgr.is_local(node_id)) {
         // Local read - direct memory access
         memcpy(dest, (void*)addr, size);
+        {
+            std::lock_guard<std::mutex> lock(conn_mgr.stats_mutex_);
+            conn_mgr.stats_.local_reads++;
+        }
         return 0;
     }
 
@@ -184,7 +188,13 @@ int pgas_cxlmemsim_hooker::remote_read(uint16_t node_id, uint64_t addr,
         return -1;
     }
 
-    return cxlmemsim_remote_load(ctx, addr, dest, size);
+    int ret = cxlmemsim_remote_load(ctx, addr, dest, size);
+    {
+        std::lock_guard<std::mutex> lock(conn_mgr.stats_mutex_);
+        conn_mgr.stats_.remote_reads++;
+        conn_mgr.stats_.total_remote_latency_ns += ctx->total_latency_ns;
+    }
+    return ret;
 }
 
 int pgas_cxlmemsim_hooker::remote_write(uint16_t node_id, uint64_t addr,
@@ -194,6 +204,10 @@ int pgas_cxlmemsim_hooker::remote_write(uint16_t node_id, uint64_t addr,
     if (conn_mgr.is_local(node_id)) {
         // Local write - direct memory access
         memcpy((void*)addr, src, size);
+        {
+            std::lock_guard<std::mutex> lock(conn_mgr.stats_mutex_);
+            conn_mgr.stats_.local_writes++;
+        }
         return 0;
     }
 
@@ -204,7 +218,13 @@ int pgas_cxlmemsim_hooker::remote_write(uint16_t node_id, uint64_t addr,
         return -1;
     }
 
-    return cxlmemsim_remote_store(ctx, addr, src, size);
+    int ret = cxlmemsim_remote_store(ctx, addr, src, size);
+    {
+        std::lock_guard<std::mutex> lock(conn_mgr.stats_mutex_);
+        conn_mgr.stats_.remote_writes++;
+        conn_mgr.stats_.total_remote_latency_ns += ctx->total_latency_ns;
+    }
+    return ret;
 }
 
 uint16_t pgas_cxlmemsim_hooker::addr_to_node(uint64_t addr) const {

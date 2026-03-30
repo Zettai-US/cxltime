@@ -59,9 +59,11 @@ private:
     uint16_t local_node_id_ = 0;
     mutable std::mutex mutex_;
 
-    // Statistics (atomic for thread safety)
+    // Statistics
     mutable stats stats_;
     mutable std::mutex stats_mutex_;
+
+    friend class pgas_cxlmemsim_hooker;
 };
 
 // PGAS hooker with CXLMemSim integration
