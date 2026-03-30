@@ -63,10 +63,9 @@ public:
     bool is_overrided;
     uint64_t user_ret;
 
-    // Original function pointers (to avoid re-entrancy)
-    void *(*orig_memcpy)(void *, const void *, size_t);
-    void *(*orig_memmove)(void *, const void *, size_t);
-    void *(*orig_memset)(void *, int, size_t);
+    // Original function pointer returned by gum_interceptor_replace().
+    // This bypasses the Frida hook trampoline to call the real implementation.
+    gpointer orig_function;
 
     pgas_internal_attach_entry(void *func, uint16_t local_node, uint16_t num_nodes,
                                 uint64_t base_addr, uint64_t size);
@@ -142,7 +141,8 @@ private:
     // Helper methods
     void *resolve_symbol(const std::string &module, const std::string &symbol);
     pgas_internal_attach_entry* get_or_create_internal_entry(
-        void *addr, uint16_t local_node, uint16_t num_nodes);
+        void *addr, uint16_t local_node, uint16_t num_nodes,
+        pgas_op_type op_type = pgas_op_type::MEMCPY);
 };
 
 // Attach type constants for PGAS

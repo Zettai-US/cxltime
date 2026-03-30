@@ -25,12 +25,9 @@ extern "C" void *pgas_memcpy_override_handler();
 extern "C" void *pgas_memmove_override_handler();
 extern "C" void *pgas_memset_override_handler();
 
-// Import original function pointers from pgas_preload (set before hooks are installed)
-extern "C" {
-    extern void* (*pgas_orig_memcpy)(void*, const void*, size_t);
-    extern void* (*pgas_orig_memmove)(void*, const void*, size_t);
-    extern void* (*pgas_orig_memset)(void*, int, size_t);
-}
+// Note: original function pointers are now obtained from Frida's
+// gum_interceptor_replace() 5th parameter (stored in entry->orig_function)
+// instead of dlsym, which would return the hooked address and cause recursion.
 
 // Frida listener interface - use simple struct approach like frida_uprobe_attach_impl
 struct _PgasListener {
@@ -100,11 +97,7 @@ pgas_internal_attach_entry::pgas_internal_attach_entry(
       local_node_id(local_node), num_nodes(num_nodes),
       pgas_base_addr(base_addr), pgas_size(size),
       is_overrided(false), user_ret(0),
-      orig_memcpy(nullptr), orig_memmove(nullptr), orig_memset(nullptr) {
-    // Get original function pointers using RTLD_NEXT to avoid re-entrancy
-    orig_memcpy = (void *(*)(void *, const void *, size_t))dlsym(RTLD_NEXT, "memcpy");
-    orig_memmove = (void *(*)(void *, const void *, size_t))dlsym(RTLD_NEXT, "memmove");
-    orig_memset = (void *(*)(void *, int, size_t))dlsym(RTLD_NEXT, "memset");
+      orig_function(nullptr) {
 }
 
 pgas_internal_attach_entry::~pgas_internal_attach_entry() {
@@ -295,11 +288,12 @@ extern "C" void *pgas_memcpy_override_handler() {
         return dest;
     }
 
-    // Both local - perform the actual memcpy using original function
-    if (pgas_orig_memcpy) {
-        return pgas_orig_memcpy(dest, src, n);
+    // Both local - call the REAL original via Frida's saved pointer
+    if (entry->orig_function) {
+        auto real_fn = (void *(*)(void *, const void *, size_t))entry->orig_function;
+        return real_fn(dest, src, n);
     }
-    // Fallback: inline copy if orig_memcpy not available
+    // Fallback: inline copy
     char *d = (char *)dest;
     const char *s = (const char *)src;
     for (size_t i = 0; i < n; i++) {
@@ -357,9 +351,10 @@ extern "C" void *pgas_memmove_override_handler() {
         }
     }
 
-    // Both local - use original function
-    if (pgas_orig_memmove) {
-        return pgas_orig_memmove(dest, src, n);
+    // Both local - call the REAL original via Frida's saved pointer
+    if (entry->orig_function) {
+        auto real_fn = (void *(*)(void *, const void *, size_t))entry->orig_function;
+        return real_fn(dest, src, n);
     }
     // Fallback: safe byte-by-byte copy
     char *d = (char *)dest;
@@ -413,9 +408,10 @@ extern "C" void *pgas_memset_override_handler() {
         return s;
     }
 
-    // Local - use original function
-    if (pgas_orig_memset) {
-        return pgas_orig_memset(s, c, n);
+    // Local - call the REAL original via Frida's saved pointer
+    if (entry->orig_function) {
+        auto real_fn = (void *(*)(void *, int, size_t))entry->orig_function;
+        return real_fn(s, c, n);
     }
     // Fallback: inline memset
     unsigned char *p = (unsigned char *)s;
@@ -499,9 +495,9 @@ int pgas_attach_impl::create_pgas_hook(
         }
     }
 
-    // Get or create internal entry
+    // Get or create internal entry (pass op_type to select the right handler)
     auto *internal = get_or_create_internal_entry(
-        target, priv.local_node_id, priv.num_nodes);
+        target, priv.local_node_id, priv.num_nodes, priv.op_type);
 
     // Create user attach entry
     int id = allocate_id();
@@ -574,7 +570,8 @@ void *pgas_attach_impl::resolve_symbol(const std::string &module,
 }
 
 pgas_internal_attach_entry* pgas_attach_impl::get_or_create_internal_entry(
-    void *addr, uint16_t local_node, uint16_t num_nodes) {
+    void *addr, uint16_t local_node, uint16_t num_nodes,
+    pgas_op_type op_type) {
 
     auto it = internal_attaches.find(addr);
     if (it != internal_attaches.end()) {
@@ -591,10 +588,30 @@ pgas_internal_attach_entry* pgas_attach_impl::get_or_create_internal_entry(
     listener->hook_entry = entry.get();
     entry->listener = GUM_INVOCATION_LISTENER(listener);
 
-    // Attach using Frida interceptor with override
-    gum_interceptor_replace(interceptor, addr,
-                            (void *)pgas_memcpy_override_handler,
-                            entry.get(), nullptr);
+    // Select the right override handler based on operation type
+    void *handler;
+    switch (op_type) {
+    case pgas_op_type::MEMSET:
+        handler = (void *)pgas_memset_override_handler;
+        break;
+    case pgas_op_type::MEMMOVE:
+        handler = (void *)pgas_memmove_override_handler;
+        break;
+    default:
+        handler = (void *)pgas_memcpy_override_handler;
+        break;
+    }
+
+    // Attach using Frida interceptor with override.
+    // The 5th parameter receives a pointer to the REAL original function,
+    // bypassing the Frida trampoline. This is critical to avoid infinite
+    // recursion when the override handler calls the original.
+    gpointer orig_func = nullptr;
+    gum_interceptor_replace(interceptor, addr, handler,
+                            entry.get(), &orig_func);
+    entry->orig_function = orig_func;
+    SPDLOG_INFO("Captured original function at {} (hook at {}, op={})",
+                orig_func, addr, (int)op_type);
 
     auto *result = entry.get();
     internal_attaches[addr] = std::move(entry);
