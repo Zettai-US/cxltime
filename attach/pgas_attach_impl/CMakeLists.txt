@@ -15,12 +15,19 @@ set(PGAS_ATTACH_HEADERS
 )
 
 # CXLMemSim client library path (from libpgas)
+set(CXLMEMSIM_CLIENT_SRC ${CMAKE_SOURCE_DIR}/src/libpgas/src/cxlmemsim_client.c)
 set(CXLMEMSIM_CLIENT_INCLUDE ${CMAKE_SOURCE_DIR}/src/libpgas/include ${CMAKE_SOURCE_DIR}/src/libpgas/include/pgas)
+
+if(NOT EXISTS "${CXLMEMSIM_CLIENT_SRC}" OR NOT EXISTS "${CMAKE_SOURCE_DIR}/src/libpgas/include")
+    message(WARNING "Skipping pgas_attach_impl: libpgas client files were not found")
+    return()
+endif()
 
 # Create library
 add_library(bpftime_pgas_attach_impl STATIC
     ${PGAS_ATTACH_SOURCES}
     ${PGAS_ATTACH_HEADERS}
+    ${CXLMEMSIM_CLIENT_SRC}
 )
 
 # Include directories

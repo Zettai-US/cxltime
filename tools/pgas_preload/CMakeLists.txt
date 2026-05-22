@@ -9,11 +9,6 @@ else()
     set(CXLMEMSIM_CLIENT_SRC ${CMAKE_SOURCE_DIR}/src/libpgas/src/cxlmemsim_client.c)
 endif()
 
-add_library(pgas_preload SHARED
-    pgas_preload.cpp
-    ${CXLMEMSIM_CLIENT_SRC}
-)
-
 # Include directories
 # Determine libpgas include path
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../src/libpgas/include")
@@ -21,6 +16,16 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../src/libpgas/include")
 else()
     set(LIBPGAS_INCLUDE ${CMAKE_SOURCE_DIR}/src/libpgas/include)
 endif()
+
+if(NOT EXISTS "${CXLMEMSIM_CLIENT_SRC}" OR NOT EXISTS "${LIBPGAS_INCLUDE}")
+    message(WARNING "Skipping pgas_preload: libpgas client files were not found")
+    return()
+endif()
+
+add_library(pgas_preload SHARED
+    pgas_preload.cpp
+    ${CXLMEMSIM_CLIENT_SRC}
+)
 
 target_include_directories(pgas_preload PRIVATE
     ${CMAKE_SOURCE_DIR}/attach/pgas_attach_impl/include
