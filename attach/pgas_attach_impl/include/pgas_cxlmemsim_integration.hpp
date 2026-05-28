@@ -23,7 +23,8 @@ public:
     }
 
     // Initialize connections to CXLMemSim servers
-    int init(const std::vector<pgas_node_info>& nodes, uint16_t local_node_id);
+    int init(const std::vector<pgas_node_info>& nodes, uint16_t local_node_id,
+             bool eager_connect = false);
 
     // Get connection for a specific node
     cxlmemsim_ctx_t* get_connection(uint16_t node_id);
@@ -55,6 +56,9 @@ private:
     cxlmemsim_connection_manager() = default;
     ~cxlmemsim_connection_manager() { shutdown(); }
 
+    int connect_node_locked(uint16_t node_id);
+
+    std::unordered_map<uint16_t, pgas_node_info> node_configs_;
     std::unordered_map<uint16_t, std::unique_ptr<cxlmemsim_ctx_t>> connections_;
     uint16_t local_node_id_ = 0;
     mutable std::mutex mutex_;
@@ -86,6 +90,8 @@ public:
         // Behavior options
         bool enable_local_cache = false;
         bool enable_statistics = true;
+        bool eager_connect = false;
+        bool use_node_local_offsets = true;
     };
 
     static pgas_cxlmemsim_hooker& instance() {

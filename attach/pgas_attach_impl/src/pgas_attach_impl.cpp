@@ -125,10 +125,13 @@ uint16_t pgas_internal_attach_entry::route_to_node(uint64_t addr) const {
         return local_node_id;  // Not in PGAS region, treat as local
     }
 
-    // Simple hash-based routing within PGAS region
-    uint64_t offset = addr - pgas_base_addr;
     uint64_t region_size = pgas_size / num_nodes;
-    return (uint16_t)(offset / region_size) % num_nodes;
+    if (region_size == 0) return local_node_id;
+
+    uint64_t offset = addr - pgas_base_addr;
+    uint64_t node = offset / region_size;
+    if (node >= num_nodes) node = num_nodes - 1;
+    return static_cast<uint16_t>(node);
 }
 
 void pgas_internal_attach_entry::execute_load_callbacks(

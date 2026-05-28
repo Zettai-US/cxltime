@@ -7,6 +7,9 @@
 #include <sstream>
 #include <cstring>
 #include <dlfcn.h>
+#include <cstdlib>
+#include <cctype>
+#include <limits>
 
 namespace bpftime {
 namespace attach {
@@ -15,45 +18,91 @@ namespace attach {
 // cxlmemsim_connection_manager implementation
 // ============================================================================
 
+int cxlmemsim_connection_manager::connect_node_locked(uint16_t node_id) {
+    if (node_id == local_node_id_) return 0;
+    if (connections_.find(node_id) != connections_.end()) return 0;
+
+    auto node_it = node_configs_.find(node_id);
+    if (node_it == node_configs_.end()) {
+        SPDLOG_ERROR("No CXLMemSim config for node {}", node_id);
+        return -1;
+    }
+
+    const auto& node = node_it->second;
+    if (node.port == 0) {
+        SPDLOG_ERROR("CXLMemSim node {} has no TCP port configured", node_id);
+        return -1;
+    }
+
+    auto ctx = std::make_unique<cxlmemsim_ctx_t>();
+    if (cxlmemsim_init(ctx.get(), node.hostname.c_str(), node.port) != 0) {
+        SPDLOG_ERROR("Failed to init CXLMemSim client for node {}", node_id);
+        return -1;
+    }
+
+    if (cxlmemsim_connect(ctx.get()) != 0) {
+        SPDLOG_ERROR("Failed to connect to CXLMemSim server at {}:{} for node {}",
+                     node.hostname, node.port, node_id);
+        cxlmemsim_finalize(ctx.get());
+        return -1;
+    }
+
+    SPDLOG_INFO("Connected to CXLMemSim server for node {} at {}:{}",
+                node_id, node.hostname, node.port);
+    connections_[node_id] = std::move(ctx);
+    return 0;
+}
+
 int cxlmemsim_connection_manager::init(
     const std::vector<pgas_node_info>& nodes,
-    uint16_t local_node_id) {
+    uint16_t local_node_id,
+    bool eager_connect) {
 
     std::lock_guard<std::mutex> lock(mutex_);
+
+    for (auto& [id, ctx] : connections_) {
+        cxlmemsim_finalize(ctx.get());
+    }
+    connections_.clear();
+    node_configs_.clear();
     local_node_id_ = local_node_id;
 
     for (const auto& node : nodes) {
-        if (node.node_id == local_node_id) {
+        node_configs_[node.node_id] = node;
+        if (node.node_id == local_node_id_) {
             SPDLOG_INFO("Node {} is local, skipping CXLMemSim connection",
                         node.node_id);
-            continue;
         }
-
-        auto ctx = std::make_unique<cxlmemsim_ctx_t>();
-        if (cxlmemsim_init(ctx.get(), node.hostname.c_str(), node.port) != 0) {
-            SPDLOG_ERROR("Failed to init CXLMemSim client for node {}",
-                         node.node_id);
-            continue;
-        }
-
-        if (cxlmemsim_connect(ctx.get()) != 0) {
-            SPDLOG_ERROR("Failed to connect to CXLMemSim server at {}:{}",
-                         node.hostname, node.port);
-            cxlmemsim_finalize(ctx.get());
-            continue;
-        }
-
-        SPDLOG_INFO("Connected to CXLMemSim server for node {} at {}:{}",
-                    node.node_id, node.hostname, node.port);
-        connections_[node.node_id] = std::move(ctx);
     }
 
-    return connections_.empty() ? -1 : 0;
+    if (node_configs_.empty()) {
+        SPDLOG_WARN("No CXLMemSim nodes configured");
+        return -1;
+    }
+
+    if (eager_connect) {
+        for (const auto& [node_id, node] : node_configs_) {
+            (void)node;
+            if (node_id != local_node_id_) {
+                (void)connect_node_locked(node_id);
+            }
+        }
+    } else {
+        SPDLOG_INFO("CXLMemSim lazy connection mode: {} configured node(s)",
+                    node_configs_.size());
+    }
+
+    return 0;
 }
 
 cxlmemsim_ctx_t* cxlmemsim_connection_manager::get_connection(uint16_t node_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = connections_.find(node_id);
+    if (it != connections_.end()) return it->second.get();
+
+    if (connect_node_locked(node_id) != 0) return nullptr;
+
+    it = connections_.find(node_id);
     return (it != connections_.end()) ? it->second.get() : nullptr;
 }
 
@@ -63,6 +112,7 @@ void cxlmemsim_connection_manager::shutdown() {
         cxlmemsim_finalize(ctx.get());
     }
     connections_.clear();
+    node_configs_.clear();
 }
 
 cxlmemsim_connection_manager::stats
@@ -85,7 +135,7 @@ int pgas_cxlmemsim_hooker::init(const config& cfg) {
 
     // Initialize CXLMemSim connections
     auto& conn_mgr = cxlmemsim_connection_manager::instance();
-    if (conn_mgr.init(cfg.nodes, cfg.local_node_id) != 0) {
+    if (conn_mgr.init(cfg.nodes, cfg.local_node_id, cfg.eager_connect) != 0) {
         SPDLOG_WARN("No CXLMemSim connections established, "
                     "remote access will fail");
     }
@@ -188,7 +238,8 @@ int pgas_cxlmemsim_hooker::remote_read(uint16_t node_id, uint64_t addr,
         return -1;
     }
 
-    int ret = cxlmemsim_remote_load(ctx, addr, dest, size);
+    uint64_t remote_addr = translate_addr(addr, node_id);
+    int ret = cxlmemsim_remote_load(ctx, remote_addr, dest, size);
     {
         std::lock_guard<std::mutex> lock(conn_mgr.stats_mutex_);
         conn_mgr.stats_.remote_reads++;
@@ -218,7 +269,8 @@ int pgas_cxlmemsim_hooker::remote_write(uint16_t node_id, uint64_t addr,
         return -1;
     }
 
-    int ret = cxlmemsim_remote_store(ctx, addr, src, size);
+    uint64_t remote_addr = translate_addr(addr, node_id);
+    int ret = cxlmemsim_remote_store(ctx, remote_addr, src, size);
     {
         std::lock_guard<std::mutex> lock(conn_mgr.stats_mutex_);
         conn_mgr.stats_.remote_writes++;
@@ -231,18 +283,35 @@ uint16_t pgas_cxlmemsim_hooker::addr_to_node(uint64_t addr) const {
     if (!is_pgas_addr(addr)) {
         return config_.local_node_id;  // Non-PGAS address is local
     }
+    if (config_.num_nodes == 0 || config_.pgas_region_size == 0) {
+        return config_.local_node_id;
+    }
 
-    // Simple partitioning: each node owns a contiguous region
-    uint64_t offset = addr - config_.pgas_base_addr;
     uint64_t region_size = config_.pgas_region_size / config_.num_nodes;
-    return static_cast<uint16_t>(offset / region_size) % config_.num_nodes;
+    if (region_size == 0) return config_.local_node_id;
+
+    // Simple partitioning: each node owns a contiguous region.
+    uint64_t offset = addr - config_.pgas_base_addr;
+    uint64_t node = offset / region_size;
+    if (node >= config_.num_nodes) node = config_.num_nodes - 1;
+    return static_cast<uint16_t>(node);
 }
 
 uint64_t pgas_cxlmemsim_hooker::translate_addr(uint64_t local_addr,
                                                 uint16_t target_node) const {
-    // In this simple model, addresses are the same across nodes
-    // For more complex setups, this would do actual translation
-    return local_addr;
+    if (!config_.use_node_local_offsets || !is_pgas_addr(local_addr) ||
+        config_.num_nodes == 0 || config_.pgas_region_size == 0 ||
+        target_node >= config_.num_nodes) {
+        return local_addr;
+    }
+
+    uint64_t region_size = config_.pgas_region_size / config_.num_nodes;
+    if (region_size == 0) return local_addr;
+
+    uint64_t offset = local_addr - config_.pgas_base_addr;
+    uint64_t node_base = static_cast<uint64_t>(target_node) * region_size;
+    if (offset < node_base) return offset;
+    return offset - node_base;
 }
 
 void pgas_cxlmemsim_hooker::print_stats() const {
@@ -306,6 +375,29 @@ int pgas_remote_memset_handler(void* s, int c, size_t n, uint16_t target_node) {
 // hooks namespace - simplified interface
 // ============================================================================
 
+static std::string trim_copy(const std::string& input) {
+    size_t begin = 0;
+    while (begin < input.size() && std::isspace(static_cast<unsigned char>(input[begin]))) begin++;
+    size_t end = input.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(input[end - 1]))) end--;
+    return input.substr(begin, end - begin);
+}
+
+static bool parse_bool_value(const std::string& value) {
+    std::string v = trim_copy(value);
+    for (auto& ch : v) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return v == "1" || v == "true" || v == "yes" || v == "on";
+}
+
+static uint16_t parse_node_id_value(const std::string& value, uint16_t fallback) {
+    std::string v = trim_copy(value);
+    if (v == "none") return std::numeric_limits<uint16_t>::max();
+    long parsed = std::stol(v, nullptr, 0);
+    if (parsed < 0) return std::numeric_limits<uint16_t>::max();
+    if (parsed > std::numeric_limits<uint16_t>::max()) return fallback;
+    return static_cast<uint16_t>(parsed);
+}
+
 namespace hooks {
 
 static bool g_active = false;
@@ -319,22 +411,39 @@ int init_from_config(const std::string& config_file) {
         return -1;
     }
 
+    uint16_t max_node_id = 0;
+    bool saw_node = false;
     std::string line;
     while (std::getline(file, line)) {
-        if (line.empty() || line[0] == '#') continue;
+        auto comment = line.find('#');
+        if (comment != std::string::npos) line.erase(comment);
+        line = trim_copy(line);
+        if (line.empty()) continue;
 
-        std::istringstream iss(line);
-        std::string key, value;
-        if (std::getline(iss, key, '=') && std::getline(iss, value)) {
+        auto sep = line.find('=');
+        if (sep == std::string::npos) continue;
+
+        std::string key = trim_copy(line.substr(0, sep));
+        std::string value = trim_copy(line.substr(sep + 1));
+        try {
             if (key == "local_node_id") {
-                cfg.local_node_id = std::stoi(value);
+                cfg.local_node_id = parse_node_id_value(value, cfg.local_node_id);
             } else if (key == "num_nodes") {
-                cfg.num_nodes = std::stoi(value);
+                unsigned long parsed = std::stoul(value, nullptr, 0);
+                if (parsed > 0 && parsed <= std::numeric_limits<uint16_t>::max()) {
+                    cfg.num_nodes = static_cast<uint16_t>(parsed);
+                }
             } else if (key == "pgas_base") {
                 cfg.pgas_base_addr = std::stoull(value, nullptr, 0);
             } else if (key == "pgas_size") {
                 cfg.pgas_region_size = std::stoull(value, nullptr, 0);
-            } else if (key.substr(0, 9) == "cxlmemsim") {
+            } else if (key == "eager_connect") {
+                cfg.eager_connect = parse_bool_value(value);
+            } else if (key == "use_node_local_offsets") {
+                cfg.use_node_local_offsets = parse_bool_value(value);
+            } else if (key == "remote_addr_mode") {
+                cfg.use_node_local_offsets = (value != "global");
+            } else if (key.rfind("cxlmemsim", 0) == 0) {
                 // Parse cxlmemsimN=host:port:node_id
                 pgas_node_info node;
                 std::istringstream vss(value);
@@ -342,13 +451,27 @@ int init_from_config(const std::string& config_file) {
                 if (std::getline(vss, host, ':') &&
                     std::getline(vss, port_str, ':') &&
                     std::getline(vss, node_id_str)) {
-                    node.hostname = host;
-                    node.port = std::stoi(port_str);
-                    node.node_id = std::stoi(node_id_str);
-                    cfg.nodes.push_back(node);
+                    unsigned long port = std::stoul(trim_copy(port_str), nullptr, 0);
+                    unsigned long node_id = std::stoul(trim_copy(node_id_str), nullptr, 0);
+                    if (port <= std::numeric_limits<uint16_t>::max() &&
+                        node_id <= std::numeric_limits<uint16_t>::max()) {
+                        node.hostname = trim_copy(host);
+                        node.port = static_cast<uint16_t>(port);
+                        node.node_id = static_cast<uint16_t>(node_id);
+                        cfg.nodes.push_back(node);
+                        if (!saw_node || node.node_id > max_node_id) max_node_id = node.node_id;
+                        saw_node = true;
+                    }
                 }
             }
+        } catch (const std::exception& e) {
+            SPDLOG_WARN("Ignoring invalid config line '{}': {}", line, e.what());
         }
+    }
+
+    if (saw_node && max_node_id < std::numeric_limits<uint16_t>::max() &&
+        max_node_id >= cfg.num_nodes) {
+        cfg.num_nodes = max_node_id + 1;
     }
 
     return pgas_cxlmemsim_hooker::instance().init(cfg);

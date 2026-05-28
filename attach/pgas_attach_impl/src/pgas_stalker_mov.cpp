@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <vector>
 #include <mutex>
+#include <limits>
 
 using namespace bpftime::attach;
 
@@ -205,6 +206,10 @@ static uint64_t compute_ea(const GumCpuContext *cpu, const mov_mem_info *info) {
     return ea;
 }
 
+static bool is_in_pgas_range(uint64_t ea, uint64_t base, uint64_t size) {
+    return size != 0 && ea >= base && (ea - base) < size;
+}
+
 // ---------------------------------------------------------------------------
 // OPT 4: Lock-free bump allocator for callout metadata
 // ---------------------------------------------------------------------------
@@ -247,10 +252,15 @@ static void mov_load_callout(GumCpuContext *cpu_context, gpointer user_data) {
     auto *cd = (mov_callout_data *)user_data;
 
     uint64_t ea = compute_ea(cpu_context, &cd->info);
+    if (!is_in_pgas_range(ea, cd->pgas_base, cd->pgas_size) ||
+        cd->num_nodes == 0) {
+        return;
+    }
 
     // Route to node
     uint64_t offset = ea - cd->pgas_base;
     uint64_t region_per_node = cd->pgas_size / cd->num_nodes;
+    if (region_per_node == 0) return;
     uint16_t node = (uint16_t)(offset / region_per_node);
     if (node >= cd->num_nodes) node = cd->num_nodes - 1;
 
@@ -275,9 +285,14 @@ static void mov_store_callout(GumCpuContext *cpu_context, gpointer user_data) {
     auto *cd = (mov_callout_data *)user_data;
 
     uint64_t ea = compute_ea(cpu_context, &cd->info);
+    if (!is_in_pgas_range(ea, cd->pgas_base, cd->pgas_size) ||
+        cd->num_nodes == 0) {
+        return;
+    }
 
     uint64_t offset = ea - cd->pgas_base;
     uint64_t region_per_node = cd->pgas_size / cd->num_nodes;
+    if (region_per_node == 0) return;
     uint16_t node = (uint16_t)(offset / region_per_node);
     if (node >= cd->num_nodes) node = cd->num_nodes - 1;
 
@@ -341,8 +356,8 @@ static void emit_inline_range_check(GumStalkerIterator *iterator,
     bool can_inline = (info->base_reg != X86_REG_INVALID &&
                        info->index_reg == X86_REG_INVALID);
 
-    if (!can_inline) {
-        // Complex addressing or displacement-only: always callout
+    if (!can_inline || cd->pgas_size > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+        // Complex addressing or large PGAS regions use the checked callout.
         gum_stalker_iterator_put_callout(iterator,
             is_load ? mov_load_callout : mov_store_callout, cd, NULL);
         return;
