@@ -165,16 +165,23 @@ add_subdirectory(third_party/argparse)
 # main library
 add_subdirectory(vm)
 
-add_subdirectory(attach)
+if(BPFTIME_BUILD_ATTACH)
+  add_subdirectory(attach)
+endif()
 
-add_subdirectory(runtime)
+if(BPFTIME_BUILD_RUNTIME)
+  if(NOT BPFTIME_BUILD_ATTACH)
+    message(FATAL_ERROR "BPFTIME_BUILD_RUNTIME requires BPFTIME_BUILD_ATTACH")
+  endif()
+  add_subdirectory(runtime)
+endif()
 
 # option to use probe read/write checks
-if(ENABLE_PROBE_READ_CHECK)
+if(BPFTIME_BUILD_RUNTIME AND ENABLE_PROBE_READ_CHECK)
   target_compile_definitions(runtime PRIVATE ENABLE_PROBE_READ_CHECK=1)
 endif()
 
-if(ENABLE_PROBE_WRITE_CHECK)
+if(BPFTIME_BUILD_RUNTIME AND ENABLE_PROBE_WRITE_CHECK)
   target_compile_definitions(runtime PRIVATE ENABLE_PROBE_WRITE_CHECK=1)
 endif()
 
@@ -203,15 +210,19 @@ if(${BPFTIME_BUILD_STATIC_LIB})
   endif()
 
 
-  bpftime_add_libs_component_command(${FRIDA_GUM_INSTALL_DIR}/libfrida-gum.a)
-  bpftime_add_static_lib_component_command(bpftime_frida_uprobe_attach_impl)
+  if(TARGET bpftime_frida_uprobe_attach_impl)
+    bpftime_add_libs_component_command(${FRIDA_GUM_INSTALL_DIR}/libfrida-gum.a)
+    bpftime_add_static_lib_component_command(bpftime_frida_uprobe_attach_impl)
+  endif()
 
   if(${BPFTIME_BUILD_WITH_LIBBPF})
     bpftime_add_libs_component_command(${CMAKE_CURRENT_BUILD_DIR}libbpf/libbpf/libbpf.a)
     bpftime_add_static_lib_component_command(bpftime_syscall_trace_attach_impl)
   endif()
 
-  bpftime_add_static_lib_component_command(runtime)
+  if(TARGET runtime)
+    bpftime_add_static_lib_component_command(runtime)
+  endif()
   bpftime_add_static_lib_component_command(spdlog)
   add_custom_command(OUTPUT "libbpftime.a"
     ${BPFTIME_STATIC_LIB_AR_CMDS}
@@ -235,19 +246,21 @@ if(${BPFTIME_BUILD_STATIC_LIB})
   )
 endif()
 
-if(${BUILD_BPFTIME_DAEMON} AND ${BPFTIME_BUILD_WITH_LIBBPF})
+if(BUILD_BPFTIME_DAEMON AND BPFTIME_BUILD_WITH_LIBBPF AND BPFTIME_BUILD_RUNTIME)
   add_subdirectory(daemon)
 endif()
 
 add_subdirectory(tools)
 
-if(${BUILD_ATTACH_IMPL_EXAMPLE})
+if(BUILD_ATTACH_IMPL_EXAMPLE AND BPFTIME_BUILD_ATTACH)
   add_subdirectory(example/attach_implementation)
-  add_subdirectory(example/pgas_memory_hook)
+  if(TARGET bpftime_pgas_attach_impl)
+    add_subdirectory(example/pgas_memory_hook)
+  endif()
 endif()
 
 # benchmark that requires bpftime libraries
-if(${BPFTIME_BUILD_WITH_LIBBPF})
+if(BPFTIME_BUILD_WITH_LIBBPF AND BPFTIME_BUILD_RUNTIME)
   # Currently benchmark is using libbpf
   add_subdirectory(benchmark)
 endif()
@@ -256,10 +269,14 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 set(DEST_DIR "$ENV{HOME}/.bpftime")
 
-if(${BPFTIME_BUILD_WITH_LIBBPF})
-  install(TARGETS bpftime-agent bpftime_text_segment_transformer bpftime-syscall-server CONFIGURATIONS Release Debug RelWithDebInfo DESTINATION ${DEST_DIR})
-else()
-  install(TARGETS bpftime-agent bpftime-syscall-server CONFIGURATIONS Release Debug RelWithDebInfo DESTINATION ${DEST_DIR})
+if(TARGET bpftime-agent)
+  install(TARGETS bpftime-agent CONFIGURATIONS Release Debug RelWithDebInfo DESTINATION ${DEST_DIR})
+endif()
+if(TARGET bpftime-syscall-server)
+  install(TARGETS bpftime-syscall-server CONFIGURATIONS Release Debug RelWithDebInfo DESTINATION ${DEST_DIR})
+endif()
+if(TARGET bpftime_text_segment_transformer)
+  install(TARGETS bpftime_text_segment_transformer CONFIGURATIONS Release Debug RelWithDebInfo DESTINATION ${DEST_DIR})
 endif()
 
 # add_subdirectory(./example/mix-schedule-mnist/cpu)

@@ -98,6 +98,33 @@ option(BPFTIME_BUILD_STATIC_LIB "Whether to build a single static library for di
 # whether to build bpftime with libbpf and other linux headers
 option(BPFTIME_BUILD_WITH_LIBBPF "Whether to build with libbpf and other linux headers" ON)
 
+if(APPLE)
+  set(BPFTIME_DEFAULT_BUILD_RUNTIME OFF)
+  set(BPFTIME_DEFAULT_BUILD_ATTACH OFF)
+else()
+  set(BPFTIME_DEFAULT_BUILD_RUNTIME ON)
+  set(BPFTIME_DEFAULT_BUILD_ATTACH ON)
+endif()
+
+# whether to build the bpftime runtime/agent libraries. The runtime currently
+# contains Linux BPF headers and pthread spin locks, so keep it opt-in on macOS.
+option(BPFTIME_BUILD_RUNTIME "Whether to build the bpftime runtime and agents" ${BPFTIME_DEFAULT_BUILD_RUNTIME})
+
+# whether to build attach implementations.
+option(BPFTIME_BUILD_ATTACH "Whether to build bpftime attach implementations" ${BPFTIME_DEFAULT_BUILD_ATTACH})
+
+# whether to build bpftime CLI tools that depend on the runtime.
+option(BPFTIME_BUILD_BPFTIME_TOOLS "Whether to build bpftime CLI/runtime tools" ${BPFTIME_DEFAULT_BUILD_RUNTIME})
+
+# whether to build SlugAllocator LLVM basic-block instrumentation
+option(BPFTIME_BUILD_SLUG_ALLOCATOR "Whether to build SlugAllocator LLVM instrumentation" ON)
+
+# whether to build the legacy PGAS LD_PRELOAD helper
+option(BPFTIME_BUILD_PGAS_PRELOAD "Whether to build the PGAS LD_PRELOAD helper" ON)
+
+# whether to build the legacy PGAS Frida attach implementation.
+option(BPFTIME_BUILD_PGAS_ATTACH "Whether to build the PGAS attach implementation" ON)
+
 # whether to enable probe read check
 option(ENABLE_PROBE_READ_CHECK "Whether to enable probe read check" ON)
 # whether to enable probe write check

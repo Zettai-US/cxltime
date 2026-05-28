@@ -1,0 +1,132 @@
+name: macOS SlugAllocator
+
+on:
+  push:
+    branches: [master, main, "ci/**"]
+    paths:
+      - ".github/workflows/macos-slugallocator.yml"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "tools/**"
+      - "vm/**"
+      - "third_party/**"
+  pull_request:
+    branches: ["**"]
+    paths:
+      - ".github/workflows/macos-slugallocator.yml"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "tools/**"
+      - "vm/**"
+      - "third_party/**"
+  workflow_dispatch:
+
+concurrency:
+  group: macos-slugallocator-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  slugallocator:
+    name: Build SlugAllocator on macOS
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          brew list llvm@21 >/dev/null 2>&1 || brew install llvm@21
+          LLVM_PREFIX="$(brew --prefix llvm@21)"
+          test -f "$LLVM_PREFIX/include/llvm/Passes/PassPlugin.h"
+          echo "LLVM_PREFIX=$LLVM_PREFIX" >> "$GITHUB_ENV"
+
+      - name: Configure SlugAllocator-only build
+        run: |
+          cmake -S . -B build-macos-slug \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER="$LLVM_PREFIX/bin/clang" \
+            -DCMAKE_CXX_COMPILER="$LLVM_PREFIX/bin/clang++" \
+            -DLLVM_DIR="$LLVM_PREFIX/lib/cmake/llvm" \
+            -DBPFTIME_BUILD_WITH_LIBBPF=OFF \
+            -DBPFTIME_BUILD_KERNEL_BPF=OFF \
+            -DBUILD_BPFTIME_DAEMON=OFF \
+            -DBPFTIME_LLVM_JIT=OFF \
+            -DBPFTIME_UBPF_JIT=OFF \
+            -DBPFTIME_BUILD_RUNTIME=OFF \
+            -DBPFTIME_BUILD_ATTACH=OFF \
+            -DBPFTIME_BUILD_BPFTIME_TOOLS=OFF \
+            -DBPFTIME_BUILD_PGAS_PRELOAD=OFF \
+            -DBPFTIME_BUILD_PGAS_ATTACH=OFF \
+            -DBPFTIME_BUILD_SLUG_ALLOCATOR=ON \
+            -DBPFTIME_ENABLE_UNIT_TESTING=OFF \
+            -DENABLE_EBPF_VERIFIER=OFF
+
+      - name: Build SlugAllocator pass and runtime
+        run: |
+          cmake --build build-macos-slug --target SlugAllocatorPass slug_allocator_runtime -j"$(sysctl -n hw.ncpu)"
+
+      - name: Smoke test compiler instrumentation
+        run: |
+          PASS="$PWD/build-macos-slug/tools/slug_allocator/SlugAllocatorPass.dylib"
+          RT_DIR="$PWD/build-macos-slug/tools/slug_allocator"
+          SRC="$RUNNER_TEMP/slug_smoke.c"
+          BIN="$RUNNER_TEMP/slug_smoke"
+          TRACE="$RUNNER_TEMP/slug.csv"
+
+          cat > "$SRC" <<'EOF'
+          #include <stdint.h>
+          #include <stdlib.h>
+
+          int main(void) {
+              volatile uint64_t *buf = (volatile uint64_t *)calloc(128, sizeof(uint64_t));
+              if (!buf) {
+                  return 2;
+              }
+
+              for (int i = 0; i < 128; ++i) {
+                  buf[i] = (uint64_t)i;
+              }
+
+              uint64_t sum = 0;
+              for (int i = 0; i < 128; ++i) {
+                  sum += buf[i];
+              }
+
+              free((void *)buf);
+              return sum == 8128 ? 0 : 1;
+          }
+          EOF
+
+          "$LLVM_PREFIX/bin/clang" -O1 -g \
+            -fpass-plugin="$PASS" \
+            "$SRC" \
+            -L"$RT_DIR" -lslug_allocator_runtime \
+            -Wl,-rpath,"$RT_DIR" \
+            -o "$BIN"
+
+          SLUG_TRACE="$TRACE" SLUG_STATS=0 "$BIN"
+          test -s "$TRACE"
+
+          line_count="$(wc -l < "$TRACE" | tr -d ' ')"
+          if [ "$line_count" -le 1 ]; then
+            echo "SlugAllocator trace did not contain memory events"
+            exit 1
+          fi
+
+          echo "SlugAllocator trace lines: $line_count"
+          sed -n '1,5p' "$TRACE"
+
+      - name: Upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-slugallocator-smoke
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/slug.csv
+            build-macos-slug/tools/slug_allocator/SlugAllocatorPass.dylib
+            build-macos-slug/tools/slug_allocator/libslug_allocator_runtime*.dylib
