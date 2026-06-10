@@ -182,10 +182,10 @@ static void load_config() {
                 std::istringstream iss(line);
                 std::string key, value;
                 if (std::getline(iss, key, '=') && std::getline(iss, value)) {
-                    if (key == "node_id") g_local_node_id = atoi(value.c_str());
+                    if (key == "node_id" || key == "local_node_id") g_local_node_id = atoi(value.c_str());
                     else if (key == "num_nodes") g_num_nodes = atoi(value.c_str());
-                    else if (key == "base_addr") g_pgas_base = strtoull(value.c_str(), nullptr, 0);
-                    else if (key == "size") g_pgas_size = strtoull(value.c_str(), nullptr, 0);
+                    else if (key == "base_addr" || key == "pgas_base") g_pgas_base = strtoull(value.c_str(), nullptr, 0);
+                    else if (key == "size" || key == "pgas_size") g_pgas_size = strtoull(value.c_str(), nullptr, 0);
                     else if (key == "verbose") g_verbose = (value == "1" || value == "true");
                     // CXLMemSim config file options
                     else if (key == "cxlmemsim_host") strncpy(g_cxlmemsim_host, value.c_str(), sizeof(g_cxlmemsim_host) - 1);
@@ -197,6 +197,7 @@ static void load_config() {
 
     // Environment variables override config file
     const char *env_node = getenv("PGAS_NODE_ID");
+    if (!env_node) env_node = getenv("PGAS_LOCAL_NODE");
     if (env_node) {
         g_local_node_id = atoi(env_node);
     }
@@ -207,6 +208,7 @@ static void load_config() {
     }
 
     const char *env_base = getenv("PGAS_BASE_ADDR");
+    if (!env_base) env_base = getenv("PGAS_BASE");
     if (env_base) {
         g_pgas_base = strtoull(env_base, nullptr, 0);
     }

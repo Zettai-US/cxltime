@@ -426,16 +426,16 @@ int init_from_config(const std::string& config_file) {
         std::string key = trim_copy(line.substr(0, sep));
         std::string value = trim_copy(line.substr(sep + 1));
         try {
-            if (key == "local_node_id") {
+            if (key == "local_node_id" || key == "node_id") {
                 cfg.local_node_id = parse_node_id_value(value, cfg.local_node_id);
             } else if (key == "num_nodes") {
                 unsigned long parsed = std::stoul(value, nullptr, 0);
                 if (parsed > 0 && parsed <= std::numeric_limits<uint16_t>::max()) {
                     cfg.num_nodes = static_cast<uint16_t>(parsed);
                 }
-            } else if (key == "pgas_base") {
+            } else if (key == "pgas_base" || key == "base_addr") {
                 cfg.pgas_base_addr = std::stoull(value, nullptr, 0);
-            } else if (key == "pgas_size") {
+            } else if (key == "pgas_size" || key == "size") {
                 cfg.pgas_region_size = std::stoull(value, nullptr, 0);
             } else if (key == "eager_connect") {
                 cfg.eager_connect = parse_bool_value(value);
