@@ -1,16 +1,15 @@
-# PGAS Preload Library for Memcached
+# PGAS LD_PRELOAD Library
 
-This library provides PGAS (Partitioned Global Address Space) memory operation hooks for memcached using LD_PRELOAD.
+This library provides PGAS (Partitioned Global Address Space) memory operation hooks using LD_PRELOAD. It also exposes an optional PGAS-aware remote pthread negotiation path for FAISS and other registered worker functions.
 
 ## Building
 
 ```bash
-cd /root/splash/build
-cmake -DBPFTIME_LLVM_JIT=OFF ..
-make pgas_preload
+cmake -S lib/cxltime/tools/pgas_preload -B /tmp/pgas-preload-build
+cmake --build /tmp/pgas-preload-build --target cxltime_pgas_preload
 ```
 
-The library will be built at: `lib/cxltime/tools/pgas_preload/libpgas_preload.so`
+The library will be built at: `/tmp/pgas-preload-build/libpgas_preload.so`
 
 ## Usage
 
@@ -65,11 +64,67 @@ PGAS_CONFIG=/path/to/pgas.conf LD_PRELOAD=/path/to/libpgas_preload.so memcached 
 | `PGAS_STATS` | Enable statistics output (1/0) | 1 |
 | `PGAS_CONFIG` | Path to configuration file | (none) |
 
+### Remote pthread / FAISS variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PGAS_REMOTE_THREADS` | Enable remote thread negotiation: `registered`, `auto`, or `faiss` | off |
+| `PGAS_FAISS_PRELOAD` | Enable FAISS C API wrappers and FAISS symbol allowlist | off |
+| `PGAS_REMOTE_THREAD_TARGET_NODE` | Node selected for remotable pthreads | next node |
+| `PGAS_REMOTE_THREAD_HOSTS` | Comma-separated `node=host:port` entries | `127.0.0.1:49000+node` |
+| `PGAS_REMOTE_THREAD_PORT_BASE` | Base listener port | 49000 |
+| `PGAS_REMOTE_THREAD_PORT` | Explicit local listener port | base + local node |
+| `PGAS_REMOTE_THREAD_STRICT` | Return failure instead of local fallback when remote create fails | 0 |
+| `PGAS_REMOTE_THREAD_ALLOWLIST` | Comma-separated symbol substrings for auto registration | FAISS symbols when FAISS mode is on |
+
+Remote thread creation is intentionally conservative. A thread is only remoted when its start routine is registered or matches the enabled allowlist, and its argument must point into the PGAS region unless the function was registered with `PGAS_REMOTE_THREAD_F_ALLOW_NONPGAS_ARG`.
+
+```c
+#include "pgas/pgas_remote_thread.h"
+
+static void *faiss_worker(void *arg) {
+    /* arg should describe PGAS-resident FAISS query/index/result buffers */
+    return NULL;
+}
+
+pgas_faiss_register_thread("faiss_worker", faiss_worker,
+                           PGAS_REMOTE_THREAD_ABI_VERSION, 0);
+```
+
+FAISS C API calls are wrapped without a compile-time libfaiss dependency:
+
+```c
+faiss_Index_search(...)
+faiss_Index_add(...)
+faiss_Index_train(...)
+```
+
+The wrappers forward to the real `RTLD_NEXT` symbols and increment remote-thread preload statistics.
+
+### Two-host FAISS PGAS application
+
+The repository includes an end-to-end two-process FAISS PGAS application test:
+
+```bash
+script/test_faiss_pgas_two_host.sh
+```
+
+The test starts a node-1 server process with the preload listener, starts a node-0 client, creates a remote FAISS shard-search pthread on node 1, joins the proxy thread on node 0, merges both shard top-k results, and validates them against an exact global search. If `libfaiss-dev` is installed, the app builds against `faiss::IndexFlatL2`; otherwise it uses an internal exact L2 fallback with the same shard-search ABI.
+
+Important knobs:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PGAS_FAISS_TWO_HOST_BIN` | Output path for the compiled app | `/tmp/faiss_pgas_two_host_app` |
+| `PGAS_FAISS_REGION_SIZE` | PGAS test region size | 64MB |
+| `PGAS_FAISS_SHM_NAME` | Local two-process shared-memory backing name | `/pgas_faiss_two_host` |
+| `PGAS_FAISS_LIBS` | Linker flags for real FAISS detection/build | `-lfaiss` |
+
 ## How It Works
 
 1. **Library Loading**: When the library is loaded via LD_PRELOAD, the constructor function `pgas_preload_init()` is called automatically.
 
-2. **Hook Installation**: The library hooks `memcpy`, `memmove`, and `memset` using Frida's interceptor.
+2. **Hook Installation**: The library interposes `memcpy`, `memmove`, `memset`, and optionally `pthread_create`, `pthread_join`, and `pthread_detach`.
 
 3. **Address Routing**: Each memory operation is analyzed to determine which node owns the target address based on a simple hash-based partitioning scheme.
 
