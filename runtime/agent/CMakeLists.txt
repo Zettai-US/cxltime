@@ -2,12 +2,14 @@ add_library(bpftime-agent SHARED
   agent.cpp
 )
 
-
-if(${BPFTIME_BUILD_WITH_LIBBPF})
-  add_dependencies(bpftime-agent FridaGum spdlog::spdlog bpftime_frida_uprobe_attach_impl bpftime_syscall_trace_attach_impl)
-else()
-  add_dependencies(bpftime-agent FridaGum spdlog::spdlog bpftime_frida_uprobe_attach_impl)
+set(BPFTIME_AGENT_ATTACH_DEPS FridaGum spdlog::spdlog bpftime_frida_uprobe_attach_impl)
+set(BPFTIME_AGENT_ATTACH_LIBS bpftime_frida_uprobe_attach_impl)
+if(TARGET bpftime_syscall_trace_attach_impl)
+  list(APPEND BPFTIME_AGENT_ATTACH_DEPS bpftime_syscall_trace_attach_impl)
+  list(APPEND BPFTIME_AGENT_ATTACH_LIBS bpftime_syscall_trace_attach_impl)
 endif()
+
+add_dependencies(bpftime-agent ${BPFTIME_AGENT_ATTACH_DEPS})
 
 set_target_properties(bpftime-agent PROPERTIES CXX_STANDARD 20 LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/agent.version)
 
@@ -65,8 +67,7 @@ if(${BPFTIME_BUILD_WITH_LIBBPF})
     -lm
     -ldl
     spdlog::spdlog
-    bpftime_frida_uprobe_attach_impl
-    bpftime_syscall_trace_attach_impl
+    ${BPFTIME_AGENT_ATTACH_LIBS}
     ${EXTRA_LINK_LIBS}
   )
 
@@ -87,7 +88,7 @@ else()
     -lm
     -ldl
     spdlog::spdlog
-    bpftime_frida_uprobe_attach_impl
+    ${BPFTIME_AGENT_ATTACH_LIBS}
     ${EXTRA_LINK_LIBS}
   )
 endif()

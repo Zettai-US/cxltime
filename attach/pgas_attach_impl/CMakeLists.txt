@@ -1,10 +1,18 @@
 cmake_minimum_required(VERSION 3.15)
 
 # PGAS Attach Implementation using Frida with CXLMemSim integration
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|i[3-6]86)$")
+    set(PGAS_STALKER_SOURCE src/pgas_stalker_mov.cpp)
+    message(STATUS "PGAS instruction-level Stalker enabled for ${CMAKE_SYSTEM_PROCESSOR}")
+else()
+    set(PGAS_STALKER_SOURCE src/pgas_stalker_stub.cpp)
+    message(STATUS "PGAS instruction-level Stalker disabled for ${CMAKE_SYSTEM_PROCESSOR}; using function-level preload hooks only")
+endif()
+
 set(PGAS_ATTACH_SOURCES
     src/pgas_attach_impl.cpp
     src/pgas_cxlmemsim_integration.cpp
-    src/pgas_stalker_mov.cpp
+    ${PGAS_STALKER_SOURCE}
 )
 
 set(PGAS_ATTACH_HEADERS
@@ -29,21 +37,24 @@ add_library(bpftime_pgas_attach_impl STATIC
     ${PGAS_ATTACH_HEADERS}
     ${CXLMEMSIM_CLIENT_SRC}
 )
+add_dependencies(bpftime_pgas_attach_impl FridaGum spdlog::spdlog)
 
 # Include directories
+target_include_directories(bpftime_pgas_attach_impl BEFORE PRIVATE
+    ${SPDLOG_INCLUDE}
+)
 target_include_directories(bpftime_pgas_attach_impl PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../base_attach_impl
     ${CMAKE_CURRENT_SOURCE_DIR}/../frida_uprobe_attach_impl/include
     ${CXLMEMSIM_CLIENT_INCLUDE}
-    ${SPDLOG_INCLUDE}
     ${FRIDA_GUM_INSTALL_DIR}
 )
 
 # Link dependencies
 target_link_libraries(bpftime_pgas_attach_impl
     ${FRIDA_GUM_INSTALL_DIR}/libfrida-gum.a
-    spdlog
+    spdlog::spdlog
     pthread
     dl
     resolv

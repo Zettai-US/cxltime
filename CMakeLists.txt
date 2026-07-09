@@ -144,6 +144,11 @@ endif()
 
 # spdlog
 add_subdirectory(third_party/spdlog)
+set(SPDLOG_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/spdlog/include)
+if(TARGET spdlog)
+  set_target_properties(spdlog PROPERTIES DEBUG_POSTFIX "")
+  target_include_directories(spdlog BEFORE PUBLIC ${SPDLOG_INCLUDE})
+endif()
 
 if(NOT DEFINED SPDLOG_ACTIVE_LEVEL)
   add_compile_definitions(SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE)
@@ -152,8 +157,6 @@ else()
   add_compile_definitions(SPDLOG_ACTIVE_LEVEL=${SPDLOG_ACTIVE_LEVEL})
   message(STATUS "Setting SPDLOG_ACTIVE_LEVEL to ${SPDLOG_ACTIVE_LEVEL}")
 endif()
-
-set(SPDLOG_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/spdlog/include)
 
 if(BPFTIME_ENABLE_CUDA_ATTACH)
   add_compile_definitions(BPFTIME_ENABLE_CUDA_ATTACH=1)

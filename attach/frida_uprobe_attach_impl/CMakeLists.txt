@@ -27,6 +27,7 @@ set(TEST_SOURCES
     test/test_back_trace.cpp
 )
 option(TEST_LCOV "option for lcov" OFF)
+if(BUILD_TESTING)
 add_executable(bpftime_frida_uprobe_attach_tests ${TEST_SOURCES})
 
 if (${TEST_LCOV}) 
@@ -58,3 +59,6 @@ target_include_directories(bpftime_frida_uprobe_attach_tests PRIVATE ${FRIDA_UPR
 add_test(NAME bpftime_frida_uprobe_attach_tests COMMAND bpftime_frida_uprobe_attach_tests)
 
 set_property(TARGET bpftime_frida_uprobe_attach_tests bpftime_frida_uprobe_attach_impl PROPERTY CXX_STANDARD 20)
+else()
+set_property(TARGET bpftime_frida_uprobe_attach_impl PROPERTY CXX_STANDARD 20)
+endif()
