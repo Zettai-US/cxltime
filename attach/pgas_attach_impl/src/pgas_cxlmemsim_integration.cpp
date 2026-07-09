@@ -210,11 +210,12 @@ int pgas_cxlmemsim_hooker::install_hooks() {
 }
 
 void pgas_cxlmemsim_hooker::remove_hooks() {
-    if (!hooks_installed_) return;
-
+    const bool had_interceptor_hooks = hooks_installed_;
     attach_impl_.reset();
     hooks_installed_ = false;
-    SPDLOG_INFO("PGAS hooks removed");
+    if (had_interceptor_hooks) {
+        SPDLOG_INFO("PGAS hooks removed");
+    }
 }
 
 int pgas_cxlmemsim_hooker::remote_read(uint16_t node_id, uint64_t addr,

@@ -24,6 +24,8 @@
 
 using namespace bpftime::attach;
 
+#if defined(__x86_64__)
+
 // ---------------------------------------------------------------------------
 // Internal context
 // ---------------------------------------------------------------------------
@@ -620,3 +622,504 @@ void pgas_stalker_finalize(pgas_stalker_ctx_t *ctx) {
 }
 
 } // extern "C"
+
+#elif defined(__aarch64__)
+
+// ---------------------------------------------------------------------------
+// AArch64 Stalker implementation
+// ---------------------------------------------------------------------------
+
+struct pgas_stalker_ctx {
+    GumStalker *stalker;
+    GumStalkerTransformer *transformer;
+
+    pgas_stalker_config_t config;
+    pgas_stalker_stats_t stats;
+
+    bool active;
+};
+
+struct arm64_mem_info {
+    bool has_mem_op;
+    bool is_load;
+    bool is_store;
+    uint8_t mem_op_idx;
+    uint8_t reg_count;
+    uint8_t access_size;
+    uint8_t per_reg_size;
+    arm64_reg regs[2];
+    arm64_reg base_reg;
+    arm64_reg index_reg;
+    arm64_extender index_ext;
+    uint8_t index_shift;
+    int64_t disp;
+};
+
+static bool starts_with(const char *s, const char *prefix) {
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+static bool is_arm64_load(const char *mnemonic) {
+    return starts_with(mnemonic, "ldr") ||
+           starts_with(mnemonic, "ldur") ||
+           starts_with(mnemonic, "ldp") ||
+           starts_with(mnemonic, "ldnp") ||
+           starts_with(mnemonic, "ldar") ||
+           starts_with(mnemonic, "ldaxr") ||
+           starts_with(mnemonic, "ldxr");
+}
+
+static bool is_arm64_store(const char *mnemonic) {
+    return starts_with(mnemonic, "str") ||
+           starts_with(mnemonic, "stur") ||
+           starts_with(mnemonic, "stp") ||
+           starts_with(mnemonic, "stnp") ||
+           starts_with(mnemonic, "stlr") ||
+           starts_with(mnemonic, "stlxr") ||
+           starts_with(mnemonic, "stxr");
+}
+
+static bool is_supported_gpr(arm64_reg reg) {
+    if (reg >= ARM64_REG_W0 && reg <= ARM64_REG_W30) return true;
+    if (reg >= ARM64_REG_X0 && reg <= ARM64_REG_X28) return true;
+    return reg == ARM64_REG_X29 || reg == ARM64_REG_X30 ||
+           reg == ARM64_REG_SP || reg == ARM64_REG_WSP ||
+           reg == ARM64_REG_XZR || reg == ARM64_REG_WZR;
+}
+
+static bool is_stack_relative(arm64_reg reg) {
+    return reg == ARM64_REG_SP || reg == ARM64_REG_WSP ||
+           reg == ARM64_REG_X29 || reg == ARM64_REG_W29;
+}
+
+static uint8_t arm64_memory_width(const char *mnemonic, arm64_reg reg) {
+    const size_t len = strlen(mnemonic);
+    if (strstr(mnemonic, "rsb") != nullptr ||
+        (len > 0 && mnemonic[len - 1] == 'b'))
+        return 1;
+    if (strstr(mnemonic, "rsh") != nullptr ||
+        (len > 0 && mnemonic[len - 1] == 'h'))
+        return 2;
+    if (strstr(mnemonic, "rsw") != nullptr)
+        return 4;
+    if ((reg >= ARM64_REG_W0 && reg <= ARM64_REG_W30) ||
+        reg == ARM64_REG_WSP || reg == ARM64_REG_WZR)
+        return 4;
+    return 8;
+}
+
+static bool analyze_arm64_mem(const cs_insn *insn,
+                              const pgas_stalker_config_t *cfg,
+                              arm64_mem_info *out) {
+    memset(out, 0, sizeof(*out));
+    out->base_reg = ARM64_REG_INVALID;
+    out->index_reg = ARM64_REG_INVALID;
+
+    const bool is_load = is_arm64_load(insn->mnemonic);
+    const bool is_store = is_arm64_store(insn->mnemonic);
+    if (!is_load && !is_store) return false;
+    if (!cfg->hook_mov) return false;
+
+    const cs_arm64 *arm64 = &insn->detail->arm64;
+    int mem_idx = -1;
+    for (uint8_t i = 0; i < arm64->op_count; i++) {
+        if (arm64->operands[i].type == ARM64_OP_MEM) {
+            mem_idx = i;
+            break;
+        }
+    }
+    if (mem_idx < 0) return false;
+
+    out->has_mem_op = true;
+    out->is_load = is_load;
+    out->is_store = is_store;
+    out->mem_op_idx = (uint8_t)mem_idx;
+    out->base_reg = arm64->operands[mem_idx].mem.base;
+    out->index_reg = arm64->operands[mem_idx].mem.index;
+    out->index_ext = arm64->operands[mem_idx].ext;
+    out->index_shift = (uint8_t)arm64->operands[mem_idx].shift.value;
+    out->disp = arm64->operands[mem_idx].mem.disp;
+
+    for (int i = 0; i < mem_idx && out->reg_count < 2; i++) {
+        if (arm64->operands[i].type != ARM64_OP_REG) continue;
+        arm64_reg reg = (arm64_reg)arm64->operands[i].reg;
+        if (!is_supported_gpr(reg)) continue;
+        out->regs[out->reg_count++] = reg;
+        if (out->per_reg_size == 0) {
+            out->per_reg_size = arm64_memory_width(insn->mnemonic, reg);
+        }
+    }
+
+    if (out->reg_count == 0) return false;
+    if (out->per_reg_size == 0) out->per_reg_size = 8;
+    if (out->per_reg_size > 8) return false;
+
+    out->access_size = out->per_reg_size * out->reg_count;
+    if (out->access_size == 0 || out->access_size > 16) return false;
+    return true;
+}
+
+static uint64_t read_reg(const GumCpuContext *cpu, arm64_reg reg) {
+    if (reg >= ARM64_REG_X0 && reg <= ARM64_REG_X28) {
+        return cpu->x[reg - ARM64_REG_X0];
+    }
+    if (reg >= ARM64_REG_W0 && reg <= ARM64_REG_W28) {
+        return (uint32_t)cpu->x[reg - ARM64_REG_W0];
+    }
+    if (reg == ARM64_REG_X29) return cpu->fp;
+    if (reg == ARM64_REG_W29) return (uint32_t)cpu->fp;
+    if (reg == ARM64_REG_X30) return cpu->lr;
+    if (reg == ARM64_REG_W30) return (uint32_t)cpu->lr;
+    if (reg == ARM64_REG_SP || reg == ARM64_REG_WSP) return cpu->sp;
+    return 0;
+}
+
+static uint64_t compute_ea(const GumCpuContext *cpu, const arm64_mem_info *info) {
+    uint64_t ea = (uint64_t)info->disp;
+    if (info->base_reg != ARM64_REG_INVALID)
+        ea += read_reg(cpu, info->base_reg);
+    if (info->index_reg != ARM64_REG_INVALID) {
+        uint64_t index = read_reg(cpu, info->index_reg);
+        switch (info->index_ext) {
+        case ARM64_EXT_UXTB: index = (uint8_t)index; break;
+        case ARM64_EXT_UXTH: index = (uint16_t)index; break;
+        case ARM64_EXT_UXTW: index = (uint32_t)index; break;
+        case ARM64_EXT_SXTB: index = (uint64_t)(int64_t)(int8_t)index; break;
+        case ARM64_EXT_SXTH: index = (uint64_t)(int64_t)(int16_t)index; break;
+        case ARM64_EXT_SXTW: index = (uint64_t)(int64_t)(int32_t)index; break;
+        case ARM64_EXT_SXTX: index = (uint64_t)(int64_t)index; break;
+        default: break;
+        }
+        ea += index << info->index_shift;
+    }
+    return ea;
+}
+
+static bool is_in_pgas_range(uint64_t ea, uint64_t base, uint64_t size) {
+    return size != 0 && ea >= base && (ea - base) < size;
+}
+
+static void store_le(uint8_t *buf, uint64_t val, size_t size) {
+    for (size_t i = 0; i < size && i < 8; i++) {
+        buf[i] = (uint8_t)((val >> (i * 8)) & 0xff);
+    }
+}
+
+static void copy_to_shadow(uint64_t ea, const uint8_t *buf, size_t size) {
+    volatile uint8_t *dst = (volatile uint8_t *)ea;
+    for (size_t i = 0; i < size; i++) {
+        dst[i] = buf[i];
+    }
+}
+
+struct arm64_callout_data {
+    uint64_t pgas_base;
+    uint64_t pgas_size;
+    uint16_t local_node_id;
+    uint16_t num_nodes;
+    pgas_stalker_stats_t *stats;
+    arm64_mem_info info;
+};
+
+#define CALLOUT_POOL_CAPACITY (1024 * 1024)
+static arm64_callout_data g_callout_pool_storage[CALLOUT_POOL_CAPACITY];
+static uint64_t g_callout_pool_next = 0;
+
+static arm64_callout_data *alloc_callout_data() {
+    uint64_t idx = __atomic_fetch_add(&g_callout_pool_next, 1, __ATOMIC_RELAXED);
+    if (idx >= CALLOUT_POOL_CAPACITY) {
+        SPDLOG_ERROR("Callout pool exhausted ({} entries)", CALLOUT_POOL_CAPACITY);
+        return nullptr;
+    }
+    return &g_callout_pool_storage[idx];
+}
+
+static uint16_t route_node(const arm64_callout_data *cd, uint64_t ea) {
+    uint64_t region_per_node = cd->pgas_size / cd->num_nodes;
+    if (region_per_node == 0) return cd->local_node_id;
+    uint64_t offset = ea - cd->pgas_base;
+    uint16_t node = (uint16_t)(offset / region_per_node);
+    if (node >= cd->num_nodes) node = cd->num_nodes - 1;
+    return node;
+}
+
+static void arm64_load_callout(GumCpuContext *cpu_context, gpointer user_data) {
+    auto *cd = (arm64_callout_data *)user_data;
+    __atomic_fetch_add(&cd->stats->callouts_fired, 1, __ATOMIC_RELAXED);
+    uint64_t ea = compute_ea(cpu_context, &cd->info);
+    if (!is_in_pgas_range(ea, cd->pgas_base, cd->pgas_size) ||
+        cd->num_nodes == 0) {
+        return;
+    }
+
+    uint16_t node = route_node(cd, ea);
+    if (node == cd->local_node_id) {
+        __atomic_fetch_add(&cd->stats->local_passthrough, 1, __ATOMIC_RELAXED);
+        return;
+    }
+
+    uint8_t buf[16] = {};
+    size_t sz = cd->info.access_size;
+    auto &hooker = pgas_cxlmemsim_hooker::instance();
+    hooker.remote_read(node, ea, buf, sz);
+    copy_to_shadow(ea, buf, sz);
+
+    __atomic_fetch_add(&cd->stats->remote_loads, 1, __ATOMIC_RELAXED);
+}
+
+static void arm64_store_callout(GumCpuContext *cpu_context, gpointer user_data) {
+    auto *cd = (arm64_callout_data *)user_data;
+    __atomic_fetch_add(&cd->stats->callouts_fired, 1, __ATOMIC_RELAXED);
+    uint64_t ea = compute_ea(cpu_context, &cd->info);
+    if (!is_in_pgas_range(ea, cd->pgas_base, cd->pgas_size) ||
+        cd->num_nodes == 0) {
+        return;
+    }
+
+    uint16_t node = route_node(cd, ea);
+    if (node == cd->local_node_id) {
+        __atomic_fetch_add(&cd->stats->local_passthrough, 1, __ATOMIC_RELAXED);
+        return;
+    }
+
+    uint8_t buf[16] = {};
+    for (uint8_t i = 0; i < cd->info.reg_count; i++) {
+        const size_t off = (size_t)i * cd->info.per_reg_size;
+        store_le(buf + off, read_reg(cpu_context, cd->info.regs[i]),
+                 cd->info.per_reg_size);
+    }
+
+    auto &hooker = pgas_cxlmemsim_hooker::instance();
+    hooker.remote_write(node, ea, buf, cd->info.access_size);
+
+    __atomic_fetch_add(&cd->stats->remote_stores, 1, __ATOMIC_RELAXED);
+}
+
+static void transform_block(GumStalkerIterator *iterator,
+                            GumStalkerOutput *output, gpointer user_data) {
+    (void)output;
+    auto *ctx = (pgas_stalker_ctx *)user_data;
+    const cs_insn *insn;
+
+    __atomic_fetch_add(&ctx->stats.blocks_transformed, 1, __ATOMIC_RELAXED);
+
+    while (gum_stalker_iterator_next(iterator, &insn)) {
+        __atomic_fetch_add(&ctx->stats.insns_scanned, 1, __ATOMIC_RELAXED);
+
+        arm64_mem_info info;
+        if (!analyze_arm64_mem(insn, &ctx->config, &info)) {
+            gum_stalker_iterator_keep(iterator);
+            continue;
+        }
+
+        if (is_stack_relative(info.base_reg)) {
+            gum_stalker_iterator_keep(iterator);
+            continue;
+        }
+
+        bool needs_runtime = (info.base_reg != ARM64_REG_INVALID ||
+                              info.index_reg != ARM64_REG_INVALID);
+        if (!needs_runtime) {
+            uint64_t ea = (uint64_t)info.disp;
+            if (!is_in_pgas_range(ea, ctx->config.pgas_base_addr,
+                                  ctx->config.pgas_region_size)) {
+                gum_stalker_iterator_keep(iterator);
+                continue;
+            }
+        }
+
+        auto *cd = alloc_callout_data();
+        if (!cd) {
+            gum_stalker_iterator_keep(iterator);
+            continue;
+        }
+
+        cd->pgas_base = ctx->config.pgas_base_addr;
+        cd->pgas_size = ctx->config.pgas_region_size;
+        cd->local_node_id = ctx->config.local_node_id;
+        cd->num_nodes = ctx->config.num_nodes;
+        cd->stats = &ctx->stats;
+        cd->info = info;
+
+        gum_stalker_iterator_put_callout(iterator,
+            info.is_load ? arm64_load_callout : arm64_store_callout, cd, NULL);
+        gum_stalker_iterator_keep(iterator);
+
+        if (info.is_load) {
+            __atomic_fetch_add(&ctx->stats.mov_loads_hooked, 1,
+                               __ATOMIC_RELAXED);
+        } else {
+            __atomic_fetch_add(&ctx->stats.mov_stores_hooked, 1,
+                               __ATOMIC_RELAXED);
+        }
+    }
+}
+
+extern "C" {
+
+pgas_stalker_ctx_t *pgas_stalker_init(const pgas_stalker_config_t *config) {
+    auto *ctx = new pgas_stalker_ctx();
+    memset(&ctx->stats, 0, sizeof(ctx->stats));
+    ctx->config = *config;
+    ctx->active = false;
+
+    if (!config->hook_mov && !config->hook_movzx &&
+        !config->hook_movnti && !config->hook_rep_movs) {
+        ctx->config.hook_mov = true;
+    }
+
+    ctx->stalker = gum_stalker_new();
+    if (!ctx->stalker) {
+        SPDLOG_ERROR("gum_stalker_new() failed");
+        delete ctx;
+        return nullptr;
+    }
+
+    int trust = config->trust_threshold;
+    if (trust == 0) trust = -1;
+    gum_stalker_set_trust_threshold(ctx->stalker, trust);
+
+    ctx->transformer = gum_stalker_transformer_make_from_callback(
+        transform_block, ctx, NULL);
+
+    SPDLOG_INFO("PGAS ARM64 Stalker initialized: base=0x{:x} size={} nodes={} trust={}",
+                config->pgas_base_addr, config->pgas_region_size,
+                config->num_nodes, trust);
+
+    return ctx;
+}
+
+int pgas_stalker_follow_me(pgas_stalker_ctx_t *ctx) {
+    if (!ctx || !ctx->stalker) return -1;
+    gum_stalker_follow_me(ctx->stalker, ctx->transformer, NULL);
+    ctx->active = true;
+    SPDLOG_INFO("ARM64 Stalker following current thread");
+    return 0;
+}
+
+int pgas_stalker_follow(pgas_stalker_ctx_t *ctx, GumThreadId thread_id) {
+    if (!ctx || !ctx->stalker) return -1;
+    gum_stalker_follow(ctx->stalker, thread_id, ctx->transformer, NULL);
+    ctx->active = true;
+    SPDLOG_INFO("ARM64 Stalker following thread {}", thread_id);
+    return 0;
+}
+
+void pgas_stalker_unfollow_me(pgas_stalker_ctx_t *ctx) {
+    if (!ctx || !ctx->stalker) return;
+    gum_stalker_unfollow_me(ctx->stalker);
+    SPDLOG_INFO("ARM64 Stalker unfollowed current thread");
+}
+
+void pgas_stalker_unfollow(pgas_stalker_ctx_t *ctx, GumThreadId thread_id) {
+    if (!ctx || !ctx->stalker) return;
+    gum_stalker_unfollow(ctx->stalker, thread_id);
+}
+
+void pgas_stalker_activate(pgas_stalker_ctx_t *ctx, const void *target) {
+    if (!ctx || !ctx->stalker) return;
+    gum_stalker_activate(ctx->stalker, target);
+}
+
+void pgas_stalker_deactivate(pgas_stalker_ctx_t *ctx) {
+    if (!ctx || !ctx->stalker) return;
+    gum_stalker_deactivate(ctx->stalker);
+}
+
+void pgas_stalker_exclude(pgas_stalker_ctx_t *ctx, uint64_t base, uint64_t size) {
+    if (!ctx || !ctx->stalker) return;
+    GumMemoryRange range;
+    range.base_address = (GumAddress)base;
+    range.size = (gsize)size;
+    gum_stalker_exclude(ctx->stalker, &range);
+}
+
+void pgas_stalker_get_stats(pgas_stalker_ctx_t *ctx, pgas_stalker_stats_t *stats) {
+    if (!ctx || !stats) return;
+    *stats = ctx->stats;
+}
+
+void pgas_stalker_print_stats(pgas_stalker_ctx_t *ctx) {
+    if (!ctx) return;
+    auto &s = ctx->stats;
+    uint64_t total_hooked = s.mov_loads_hooked + s.mov_stores_hooked;
+    uint64_t range_hits = s.remote_loads + s.remote_stores + s.local_passthrough;
+
+    printf("\n=== PGAS Stalker ARM64 Load/Store Statistics ===\n");
+    printf("JIT phase:\n");
+    printf("  Blocks transformed:   %lu\n", s.blocks_transformed);
+    printf("  Instructions scanned: %lu\n", s.insns_scanned);
+    printf("  Loads hooked:         %lu\n", s.mov_loads_hooked);
+    printf("  Stores hooked:        %lu\n", s.mov_stores_hooked);
+    printf("  Instrumentation rate: %.1f%%\n",
+           s.insns_scanned ? 100.0 * total_hooked / s.insns_scanned : 0);
+    printf("Runtime:\n");
+    printf("  Callouts fired:       %lu\n", s.callouts_fired);
+    printf("  PGAS range hits:      %lu\n", range_hits);
+    printf("  Remote loads:         %lu\n", s.remote_loads);
+    printf("  Remote stores:        %lu\n", s.remote_stores);
+    printf("  Local passthrough:    %lu\n", s.local_passthrough);
+    printf("  Callout pool used:    %lu / %d\n",
+           g_callout_pool_next, CALLOUT_POOL_CAPACITY);
+    printf("===============================================\n\n");
+}
+
+void pgas_stalker_finalize(pgas_stalker_ctx_t *ctx) {
+    if (!ctx) return;
+    if (ctx->stalker) {
+        gum_stalker_flush(ctx->stalker);
+        gum_stalker_garbage_collect(ctx->stalker);
+        g_object_unref(ctx->stalker);
+    }
+    if (ctx->transformer)
+        g_object_unref(ctx->transformer);
+
+    g_callout_pool_next = 0;
+
+    delete ctx;
+    SPDLOG_INFO("PGAS ARM64 Stalker finalized");
+}
+
+} // extern "C"
+
+#else
+
+extern "C" {
+
+pgas_stalker_ctx_t *pgas_stalker_init(const pgas_stalker_config_t *config) {
+    (void)config;
+    fprintf(stderr, "[PGAS_STALKER] instruction-level Stalker is not supported on this architecture; use function-level preload hooks.\n");
+    return nullptr;
+}
+
+int pgas_stalker_follow_me(pgas_stalker_ctx_t *ctx) { (void)ctx; return -1; }
+int pgas_stalker_follow(pgas_stalker_ctx_t *ctx, GumThreadId thread_id) {
+    (void)ctx;
+    (void)thread_id;
+    return -1;
+}
+void pgas_stalker_unfollow_me(pgas_stalker_ctx_t *ctx) { (void)ctx; }
+void pgas_stalker_unfollow(pgas_stalker_ctx_t *ctx, GumThreadId thread_id) {
+    (void)ctx;
+    (void)thread_id;
+}
+void pgas_stalker_activate(pgas_stalker_ctx_t *ctx, const void *target) {
+    (void)ctx;
+    (void)target;
+}
+void pgas_stalker_deactivate(pgas_stalker_ctx_t *ctx) { (void)ctx; }
+void pgas_stalker_exclude(pgas_stalker_ctx_t *ctx, uint64_t base, uint64_t size) {
+    (void)ctx;
+    (void)base;
+    (void)size;
+}
+void pgas_stalker_get_stats(pgas_stalker_ctx_t *ctx, pgas_stalker_stats_t *stats) {
+    (void)ctx;
+    if (stats) memset(stats, 0, sizeof(*stats));
+}
+void pgas_stalker_print_stats(pgas_stalker_ctx_t *ctx) { (void)ctx; }
+void pgas_stalker_finalize(pgas_stalker_ctx_t *ctx) { (void)ctx; }
+
+} // extern "C"
+
+#endif

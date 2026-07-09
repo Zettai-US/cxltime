@@ -45,6 +45,7 @@ typedef struct {
     uint64_t insns_scanned;        // Total instructions scanned
     uint64_t mov_loads_hooked;     // Memory load movs instrumented
     uint64_t mov_stores_hooked;    // Memory store movs instrumented
+    uint64_t callouts_fired;       // Runtime callouts entered
     uint64_t remote_loads;         // Actual remote loads executed
     uint64_t remote_stores;        // Actual remote stores executed
     uint64_t local_passthrough;    // Local accesses (no-op callout)

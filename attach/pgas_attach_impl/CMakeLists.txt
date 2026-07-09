@@ -29,6 +29,7 @@ add_library(bpftime_pgas_attach_impl STATIC
     ${PGAS_ATTACH_HEADERS}
     ${CXLMEMSIM_CLIENT_SRC}
 )
+add_dependencies(bpftime_pgas_attach_impl FridaGum spdlog::spdlog)
 
 # Include directories
 target_include_directories(bpftime_pgas_attach_impl PUBLIC
