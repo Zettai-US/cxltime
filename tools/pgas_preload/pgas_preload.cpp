@@ -516,28 +516,50 @@ extern "C" void *memcpy(void *dest, const void *src, size_t n) {
 
                     size_t remaining = n;
                     size_t offset = 0;
+                    int cxl_status = 0;
                     while (remaining > 0) {
                         size_t chunk = remaining > 4096 ? 4096 : remaining;
-                        cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src + offset, temp_buf, chunk);
-                        cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest + offset, temp_buf, chunk);
+                        cxl_status = cxlmemsim_remote_load(g_cxlmemsim_ctx,
+                                                            (uint64_t)src + offset,
+                                                            temp_buf, chunk);
+                        if (cxl_status != 0) break;
+                        cxl_status = cxlmemsim_remote_store(g_cxlmemsim_ctx,
+                                                             (uint64_t)dest + offset,
+                                                             temp_buf, chunk);
+                        if (cxl_status != 0) break;
+                        // Keep the destination shadow consistent with the
+                        // bytes actually returned by CXLMemSim, not src's
+                        // process-local anonymous shadow.
+                        pgas_orig_memcpy((char*)dest + offset, temp_buf, chunk);
                         offset += chunk;
                         remaining -= chunk;
                     }
-                    // Also do actual memcpy for data integrity
-                    pgas_orig_memcpy(dest, src, n);
-                    return dest;
+                    if (cxl_status == 0) return dest;
+                    if (g_verbose) {
+                        fprintf(stderr, "[PGAS] CXLMemSim memcpy failed (%d); using libc fallback\n",
+                                cxl_status);
+                    }
                 } else if (src_pgas) {
-                    // Source is in CXL memory: track the read via CXLMemSim
-                    cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src, dest, n);
-                    // Also do actual memcpy for data integrity
-                    pgas_orig_memcpy(dest, src, n);
-                    return dest;
+                    // On success dest already contains the remote bytes. Do
+                    // not overwrite it with src's process-local shadow.
+                    int cxl_status = cxlmemsim_remote_load(g_cxlmemsim_ctx,
+                                                            (uint64_t)src, dest, n);
+                    if (cxl_status == 0) return dest;
+                    if (g_verbose) {
+                        fprintf(stderr, "[PGAS] CXLMemSim memcpy load failed (%d); using libc fallback\n",
+                                cxl_status);
+                    }
                 } else if (dest_pgas) {
-                    // Dest is in CXL memory: track the write via CXLMemSim
-                    cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest, src, n);
-                    // Also do actual memcpy for data integrity
-                    pgas_orig_memcpy(dest, src, n);
-                    return dest;
+                    int cxl_status = cxlmemsim_remote_store(g_cxlmemsim_ctx,
+                                                             (uint64_t)dest, src, n);
+                    if (cxl_status == 0) {
+                        pgas_orig_memcpy(dest, src, n);
+                        return dest;
+                    }
+                    if (g_verbose) {
+                        fprintf(stderr, "[PGAS] CXLMemSim memcpy store failed (%d); using libc fallback\n",
+                                cxl_status);
+                    }
                 }
             }
         } else {
@@ -584,27 +606,48 @@ extern "C" void *memmove(void *dest, const void *src, size_t n) {
                     // Both in CXL memory: read from src, write to dest via CXLMemSim
                     char *temp_buf = (char*)alloca(n < 4096 ? n : 4096);
 
+                    bool copy_backward = (uintptr_t)dest > (uintptr_t)src &&
+                                         (uintptr_t)dest - (uintptr_t)src < n;
                     size_t remaining = n;
-                    size_t offset = 0;
+                    int cxl_status = 0;
                     while (remaining > 0) {
                         size_t chunk = remaining > 4096 ? 4096 : remaining;
-                        cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src + offset, temp_buf, chunk);
-                        cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest + offset, temp_buf, chunk);
-                        offset += chunk;
+                        size_t offset = copy_backward ? remaining - chunk : n - remaining;
+                        cxl_status = cxlmemsim_remote_load(g_cxlmemsim_ctx,
+                                                            (uint64_t)src + offset,
+                                                            temp_buf, chunk);
+                        if (cxl_status != 0) break;
+                        cxl_status = cxlmemsim_remote_store(g_cxlmemsim_ctx,
+                                                             (uint64_t)dest + offset,
+                                                             temp_buf, chunk);
+                        if (cxl_status != 0) break;
+                        pgas_orig_memmove((char*)dest + offset, temp_buf, chunk);
                         remaining -= chunk;
                     }
-                    pgas_orig_memmove(dest, src, n);
-                    return dest;
+                    if (cxl_status == 0) return dest;
+                    if (g_verbose) {
+                        fprintf(stderr, "[PGAS] CXLMemSim memmove failed (%d); using libc fallback\n",
+                                cxl_status);
+                    }
                 } else if (src_pgas) {
-                    // Source is in CXL memory: track the read via CXLMemSim
-                    cxlmemsim_remote_load(g_cxlmemsim_ctx, (uint64_t)src, dest, n);
-                    pgas_orig_memmove(dest, src, n);
-                    return dest;
+                    int cxl_status = cxlmemsim_remote_load(g_cxlmemsim_ctx,
+                                                            (uint64_t)src, dest, n);
+                    if (cxl_status == 0) return dest;
+                    if (g_verbose) {
+                        fprintf(stderr, "[PGAS] CXLMemSim memmove load failed (%d); using libc fallback\n",
+                                cxl_status);
+                    }
                 } else if (dest_pgas) {
-                    // Dest is in CXL memory: track the write via CXLMemSim
-                    cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)dest, src, n);
-                    pgas_orig_memmove(dest, src, n);
-                    return dest;
+                    int cxl_status = cxlmemsim_remote_store(g_cxlmemsim_ctx,
+                                                             (uint64_t)dest, src, n);
+                    if (cxl_status == 0) {
+                        pgas_orig_memmove(dest, src, n);
+                        return dest;
+                    }
+                    if (g_verbose) {
+                        fprintf(stderr, "[PGAS] CXLMemSim memmove store failed (%d); using libc fallback\n",
+                                cxl_status);
+                    }
                 }
             }
         } else {
@@ -645,15 +688,24 @@ extern "C" void *memset(void *s, int c, size_t n) {
 
                 size_t remaining = n;
                 size_t offset = 0;
+                int cxl_status = 0;
                 while (remaining > 0) {
                     size_t chunk = remaining > chunk_size ? chunk_size : remaining;
-                    cxlmemsim_remote_store(g_cxlmemsim_ctx, (uint64_t)s + offset, temp_buf, chunk);
+                    cxl_status = cxlmemsim_remote_store(g_cxlmemsim_ctx,
+                                                         (uint64_t)s + offset,
+                                                         temp_buf, chunk);
+                    if (cxl_status != 0) break;
                     offset += chunk;
                     remaining -= chunk;
                 }
-                // Also do actual memset for data integrity
-                pgas_orig_memset(s, c, n);
-                return s;
+                if (cxl_status == 0) {
+                    pgas_orig_memset(s, c, n);
+                    return s;
+                }
+                if (g_verbose) {
+                    fprintf(stderr, "[PGAS] CXLMemSim memset store failed (%d); using libc fallback\n",
+                            cxl_status);
+                }
             }
         } else {
             g_local_accesses++;

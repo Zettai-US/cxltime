@@ -213,6 +213,25 @@ The current implementation routes addresses to nodes but performs local memory o
    - For CXL: Use CXL.mem load/store semantics
    - For RDMA: Use ibverbs for remote memory access
 
+## Cross-Process OCEAN Regression
+
+`regression/pgas_preload_cross_process_test.c` verifies that a reader gets
+the bytes returned by CXLMemSim rather than its own anonymous PGAS shadow.
+`regression/cxlmemsim_direct_pattern_verify.c` reads the same pattern through
+the direct client API. On an allocated FX700 Slurm job, run:
+
+```bash
+PGAS_JOB_ID=<jobid> PGAS_CONFIG_OUT=<run-dir> \
+PGAS_PRELOAD=<path-to-libpgas_preload.so> \
+scripts/slurm_preload_cross_process_test.sh
+
+PGAS_JOB_ID=<jobid> PGAS_CONFIG_OUT=<run-dir> \
+scripts/slurm_direct_pattern_verify.sh
+```
+
+The first script requires `REMOTE_READ_VERIFY_PASS`; the second confirms the
+OCEAN-side pattern with `DIRECT_REMOTE_VERIFY_PASS`.
+
 ## Troubleshooting
 
 ### Library not loading
